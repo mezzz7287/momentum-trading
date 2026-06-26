@@ -377,11 +377,8 @@ def get_global_stats() -> dict:
             total_wins   += getattr(bot, "wins",    0)
             total_losses += getattr(bot, "losses",  0)
             in_position = (
-                getattr(bot, "spread_inventory", None) is not None
-                and (
-                    bot.spread_inventory.yes_shares > 0
-                    or bot.spread_inventory.no_shares > 0
-                )
+                (getattr(bot, "yes_shares", 0) or 0) > 0
+                or (getattr(bot, "no_shares", 0) or 0) > 0
             )
             if bot.active_market or in_position:
                 active_count += 1
@@ -1306,11 +1303,8 @@ function renderPositions(positions) {
     const cashoutKey = `${p.asset}:${p.window}`;
     const disabled = pending || !p.cashout_available;
     const btnLabel = pending ? 'Selling…' : 'Sell';
-    const sideCls = p.side === 'YES' ? 'pm-side-yes' : p.side === 'NO' ? 'pm-side-no' : 'pm-side-spread';
-    const isSpread = p.side === 'SPREAD';
-    const entryDetail = isSpread
-      ? `<span>Y ${Number(p.yes_shares||0).toFixed(1)}@${_fmtCents(p.yes_avg_price_c)} avg · N ${Number(p.no_shares||0).toFixed(1)}@${_fmtCents(p.no_avg_price_c)} avg${p.pair_avg_price_c ? ' · pair '+_fmtCents(p.pair_avg_price_c)+' avg' : ''}</span>`
-      : `<span class="${sideCls}">${p.side}</span><span>${_fmtCents(p.entry_price_cents)} → ${_fmtCents(p.current_price_cents)}</span>`;
+    const sideCls = p.side === 'YES' ? 'pm-side-yes' : 'pm-side-no';
+    const entryDetail = `<span class="${sideCls}">${p.side}</span><span>${_fmtCents(p.entry_price_cents)} → ${_fmtCents(p.current_price_cents)}</span>`;
     return `
       <div class="pm-row" data-asset="${p.asset}" data-window="${p.window || '5m'}">
         <div class="pm-row-main">
@@ -1325,8 +1319,8 @@ function renderPositions(positions) {
           <span class="pm-row-val ${roiCls}">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</span>
           <span class="pm-row-meta ${roiCls}">${_fmtUsd(pnl, true)}</span>
         </div>
-        ${isSpread ? '' : `<button class="pm-cashout-btn" ${disabled ? 'disabled' : ''}
-                onclick="cashoutPosition('${p.asset}','${p.window || '5m'}')">${btnLabel}</button>`}
+        <button class="pm-cashout-btn" ${disabled ? 'disabled' : ''}
+                onclick="cashoutPosition('${p.asset}','${p.window || '5m'}')">${btnLabel}</button>
       </div>`;
   }).join('');
 }
@@ -1346,19 +1340,14 @@ function renderTradeHistory(trades) {
     el.innerHTML = '<div class="pm-empty">No trade history yet</div>';
     return;
   }
-  el.innerHTML = trades.map(t => {
+  el.innerHTML = trades.filter(t => (t.side || '') !== 'SPREAD').map(t => {
     const { label, cls } = _historyActionStyle(t.action);
-    const isSpreadTrade = (t.side || '') === 'SPREAD';
-    const sideCls = isSpreadTrade ? 'pm-side-spread' : (t.side === 'YES' ? 'pm-side-yes' : 'pm-side-no');
+    const sideCls = t.side === 'YES' ? 'pm-side-yes' : 'pm-side-no';
     const ts = t.timestamp_ms
       ? new Date(t.timestamp_ms).toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true})
       : (t.timestamp || '—');
-    const detail = isSpreadTrade
-      ? `<span class="${sideCls}">SPREAD</span><span>Y ${Number(t.yes_size||0).toFixed(1)}@${_fmtCents((Number(t.yes_price)||0)*100)} · N ${Number(t.no_size||0).toFixed(1)}@${_fmtCents((Number(t.no_price)||0)*100)}</span>`
-      : `<span class="${sideCls}">${t.side || ''}</span><span>${_fmtCents((Number(t.price) || 0) * 100)}</span>`;
-    const sizeLabel = isSpreadTrade
-      ? `${Number(t.size||0).toFixed(2)} pair sh`
-      : `${Number(t.size).toFixed(2)} sh`;
+    const detail = `<span class="${sideCls}">${t.side || ''}</span><span>${_fmtCents((Number(t.price) || 0) * 100)}</span>`;
+    const sizeLabel = `${Number(t.size).toFixed(2)} sh`;
     return `
       <div class="pm-row">
         <div class="pm-row-main">
@@ -1557,19 +1546,23 @@ function renderCard(bot){
   const cdPnl=Number(bot.cooldown_window_pnl)||0;
   const cdPnlPos=cdPnl>=0;
   const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
-  const edgeCents=(bot.spread_edge_cents!=null)?bot.spread_edge_cents:((bot.spread_edge||0)*100);
-  const thrCents=(bot.spread_threshold_cents!=null)?bot.spread_threshold_cents:((bot.spread_threshold||0.03)*100);
-  const edgeOk=!!bot.edge_above_threshold;
-  const signal=edgeOk?`EDGE ${edgeCents.toFixed(2)}c`:'NO EDGE';
+  const deltaPct = Number(bot.momentum_delta_pct) || 0;
+  const thrPct = Number(bot.momentum_min_delta_pct) || 0.15;
+  const signalOk = !!bot.signal_above_threshold;
+  const sigDir = bot.momentum_signal || null;
+  const mode = bot.momentum_mode || 'single_taker';
+  const fresh = !!bot.momentum_feed_fresh;
+  const signal = sigDir
+    ? `${sigDir} Δ${deltaPct.toFixed(3)}%`
+    : (signalOk ? `Δ${deltaPct.toFixed(3)}%` : 'NO SIGNAL');
   const yesAvgC=(bot.yes_shares||0)>0?(bot.yes_avg_price_c||0):null;
   const noAvgC=(bot.no_shares||0)>0?(bot.no_avg_price_c||0):null;
   const yesShLabel=(bot.yes_shares||0)>0
     ?`YES ${(bot.yes_shares||0).toFixed(1)} sh avg @ ${yesAvgC.toFixed(1)}c`
-    :`YES 0 / ${(bot.max_shares||'?')}`;
+    :`YES 0 / ${(bot.momentum_max_shares||'?')}`;
   const noShLabel=(bot.no_shares||0)>0
     ?`NO ${(bot.no_shares||0).toFixed(1)} sh avg @ ${noAvgC.toFixed(1)}c`
-    :`NO 0 / ${(bot.max_shares||'?')}`;
-  const pairAvgC=(bot.pair_avg_price_c||0)>0?bot.pair_avg_price_c:null;
+    :`NO 0 / ${(bot.momentum_max_shares||'?')}`;
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
   const mw=formatMarketWindow(bot.market_start_iso,bot.market_end_iso);
@@ -1614,16 +1607,17 @@ function renderCard(bot){
           ${sigIcon(signal)} ${signal}
         </span>
         <div class="text-xs text-zinc-400 font-mono">
-          live edge <span class="${edgeOk?'text-emerald-400':'text-zinc-300'}">${edgeCents.toFixed(2)}c</span>
-          &nbsp;· need <span class="text-cyan-400">&gt;${thrCents.toFixed(1)}c</span>
+          mode <span class="text-cyan-400">${mode}</span>
+          &nbsp;· Δ <span class="${signalOk?'text-emerald-400':'text-zinc-300'}">${deltaPct.toFixed(3)}%</span>
+          &nbsp;· need <span class="text-cyan-400">&gt;${thrPct.toFixed(3)}%</span>
+          &nbsp;· ${fresh ? 'feed ok' : 'feed stale'}
         </div>
       </div>
       <div class="bg-zinc-800/60 rounded-xl px-3 py-2 mb-3 text-xs font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
-        <span>bids: ${bot.combined_bid_c||0}c</span>
-        <span>caps: ${bot.spread_captures||0}</span>
+        <span>lookback: ${bot.momentum_lookback_ms||3000}ms</span>
+        <span>trades: ${bot.momentum_trades||0}</span>
         <span>${yesShLabel}</span>
         <span>${noShLabel}</span>
-        ${pairAvgC!=null?`<span class="col-span-2">pair avg: ${pairAvgC.toFixed(1)}c</span>`:''}
       </div>
       <div class="space-y-1.5 text-sm mb-3">
         <div class="flex items-center justify-between">
@@ -1738,7 +1732,7 @@ async def api_trades_history(limit: int = 10):
 async def api_cashout(asset: str, window: str):
     raise HTTPException(
         status_code=410,
-        detail="Manual cashout removed — spread capture settles at market expiry",
+        detail="Manual cashout removed — momentum positions settle at market expiry",
     )
 
 
@@ -1746,7 +1740,7 @@ async def api_cashout(asset: str, window: str):
 async def api_cashout_legacy(asset: str):
     raise HTTPException(
         status_code=410,
-        detail="Manual cashout removed — spread capture settles at market expiry",
+        detail="Manual cashout removed — momentum positions settle at market expiry",
     )
 
 

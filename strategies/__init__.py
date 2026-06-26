@@ -1,4 +1,4 @@
-from strategies.base import SpreadDecision
-from strategies.spread_capture import SpreadCaptureStrategy
+from strategies.base import MomentumDecision
+from strategies.momentum import MomentumStrategy
 
-__all__ = ["SpreadDecision", "SpreadCaptureStrategy"]
+__all__ = ["MomentumDecision", "MomentumStrategy"]

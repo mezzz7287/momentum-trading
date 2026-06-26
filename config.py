@@ -21,6 +21,10 @@ SUPPORTED_WINDOWS: frozenset[str] = frozenset({"5m"})
 WINDOW_SECONDS: dict[str, int] = {"5m": 300}
 MIN_SHARES: int = 5
 
+MOMENTUM_MODES: frozenset[str] = frozenset(
+    {"single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"}
+)
+
 _ASSET_ALIASES: dict[str, str] = {
     "bitcoin": "btc",
     "ethereum": "eth",
@@ -52,25 +56,35 @@ def worker_key(asset: str, window: str) -> str:
     return f"{normalize_asset_slug(asset)}:{normalize_window(window)}"
 
 
-def _parse_spread_threshold(name: str, value: Any, default: float) -> float:
+def _parse_momentum_delta(name: str, value: Any, default: float) -> float:
     raw = value if value is not None else default
     try:
         v = float(raw)
     except (TypeError, ValueError):
         _fatal(f"{name}={raw!r} is not a valid number.")
-    if v <= 0 or v >= 1 or v != v:
-        _fatal(f"{name} must be between 0 and 1 exclusive (got {raw!r}).")
+    if v <= 0 or v != v or v in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be a positive fraction (got {raw!r}).")
     return v
 
 
-def _parse_positive_int(name: str, value: Any) -> int:
+def _parse_lookback_ms(name: str, value: Any, default: int) -> int:
     try:
-        v = int(value)
+        v = int(value if value is not None else default)
     except (TypeError, ValueError):
         _fatal(f"{name}={value!r} is not a valid integer.")
-    if v < MIN_SHARES:
-        _fatal(f"{name} must be >= {MIN_SHARES} (got {value!r}).")
+    if v < 100:
+        _fatal(f"{name} must be >= 100 ms (got {value!r}).")
     return v
+
+
+def _parse_momentum_mode(name: str, value: Any, default: str) -> str:
+    raw = str(value if value is not None else default).strip().lower()
+    if raw not in MOMENTUM_MODES:
+        _fatal(
+            f"{name}={raw!r} is invalid. "
+            f"Use one of: {', '.join(sorted(MOMENTUM_MODES))}."
+        )
+    return raw
 
 
 def _parse_order_size(name: str, value: Any, default: float) -> float:
@@ -113,27 +127,24 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 
 def _load_env_sizing_overrides() -> Optional[dict[str, float]]:
-    """Apply sizing overrides only when ORDER_SIZE_MIN, ORDER_SIZE_MAX, and MAX_SHARES are all set."""
-    keys = ("ORDER_SIZE_MIN", "ORDER_SIZE_MAX", "MAX_SHARES")
+    """Apply sizing overrides only when MOMENTUM_SIZE and MOMENTUM_MAX_SHARES are both set."""
+    keys = ("MOMENTUM_SIZE", "MOMENTUM_MAX_SHARES")
     raw = {k: os.getenv(k, "").strip() for k in keys}
     set_keys = [k for k, v in raw.items() if v]
     if not set_keys:
         return None
     if len(set_keys) != len(keys):
         _fatal(
-            "ORDER_SIZE_MIN, ORDER_SIZE_MAX, and MAX_SHARES must all be set together "
+            "MOMENTUM_SIZE and MOMENTUM_MAX_SHARES must both be set together "
             f"to override sizing (found: {', '.join(set_keys)}). "
-            "Omit all three to use trading_config.json defaults."
+            "Omit both to use trading_config.json defaults."
         )
-    out: dict[str, float] = {
-        "spread_size_min": _parse_order_size("ORDER_SIZE_MIN", raw["ORDER_SIZE_MIN"], 0.0),
-        "spread_size_max": _parse_order_size("ORDER_SIZE_MAX", raw["ORDER_SIZE_MAX"], 0.0),
-        "max_shares": _parse_max_shares("MAX_SHARES", raw["MAX_SHARES"], 0.0),
+    return {
+        "momentum_size": _parse_order_size("MOMENTUM_SIZE", raw["MOMENTUM_SIZE"], 0.0),
+        "momentum_max_shares": _parse_max_shares(
+            "MOMENTUM_MAX_SHARES", raw["MOMENTUM_MAX_SHARES"], 0.0,
+        ),
     }
-    optional_max_order = os.getenv("MAX_ORDER_SIZE", "").strip()
-    if optional_max_order:
-        out["max_order_size"] = _parse_order_size("MAX_ORDER_SIZE", optional_max_order, 0.0)
-    return out
 
 
 ENV_SIZING_OVERRIDES: Optional[dict[str, float]] = _load_env_sizing_overrides()
@@ -146,13 +157,12 @@ DRY_RUN_DEFAULT: bool = _parse_bool_env("DRY_RUN_DEFAULT", _parse_bool_env("DRY_
 class WorkerConfig:
     asset: str
     window: str
-    spread_threshold: float = 0.03
+    momentum_lookback_ms: int = 3000
+    momentum_min_delta: float = 0.0015
+    momentum_mode: str = "single_taker"
+    momentum_size: float = 10.0
+    momentum_max_shares: float = 10.2
     trade_cooldown_ms: int = 3000
-    spread_size_min: float = 10.0
-    spread_size_max: float = 10.0
-    max_order_size: float = 10.0
-    max_shares: float = 10.2
-    price_bias: float = 0.01
     dry_run: bool = DRY_RUN_DEFAULT
     dry_run_fill_delay_min_ms: int = 200
     dry_run_fill_delay_max_ms: int = 2500
@@ -171,14 +181,6 @@ class WorkerConfig:
     def market_slug(self, start_ts: int) -> str:
         return f"{self.asset}-updown-{self.window}-{start_ts}"
 
-    @property
-    def spread_size(self) -> float:
-        return self.spread_size_max
-
-    @property
-    def random_order_size(self) -> bool:
-        return self.spread_size_min < self.spread_size_max - 1e-9
-
 
 def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     asset = normalize_asset_slug(str(raw.get("asset", "")))
@@ -193,71 +195,46 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
             f"Supported: {sorted(SUPPORTED_WINDOWS)}"
         )
 
-    spread_threshold = _parse_spread_threshold(
-        "spread_threshold",
-        raw.get("spread_threshold", defaults.get("spread_threshold")),
-        float(defaults.get("spread_threshold", 0.03)),
+    momentum_lookback_ms = _parse_lookback_ms(
+        "momentum_lookback_ms",
+        raw.get("momentum_lookback_ms", defaults.get("momentum_lookback_ms")),
+        int(defaults.get("momentum_lookback_ms", 3000)),
+    )
+    momentum_min_delta = _parse_momentum_delta(
+        "momentum_min_delta",
+        raw.get("momentum_min_delta", defaults.get("momentum_min_delta")),
+        float(defaults.get("momentum_min_delta", 0.0015)),
+    )
+    momentum_mode = _parse_momentum_mode(
+        "momentum_mode",
+        raw.get("momentum_mode", defaults.get("momentum_mode")),
+        str(defaults.get("momentum_mode", "single_taker")),
+    )
+    momentum_size = _parse_order_size(
+        "momentum_size",
+        raw.get("momentum_size", defaults.get("momentum_size")),
+        float(defaults.get("momentum_size", 10.0)),
+    )
+    momentum_max_shares = _parse_max_shares(
+        "momentum_max_shares",
+        raw.get("momentum_max_shares", defaults.get("momentum_max_shares")),
+        float(defaults.get("momentum_max_shares", 10.2)),
     )
     trade_cooldown_ms = _parse_cooldown_ms(
         "trade_cooldown_ms",
         raw.get("trade_cooldown_ms", defaults.get("trade_cooldown_ms")),
         int(defaults.get("trade_cooldown_ms", 3000)),
     )
-    spread_size_fixed = _parse_order_size(
-        "spread_size",
-        raw.get("spread_size", defaults.get("spread_size")),
-        float(defaults.get("spread_size", 10.0)),
-    )
-    size_min_raw = raw.get("spread_size_min", defaults.get("spread_size_min"))
-    size_max_raw = raw.get("spread_size_max", defaults.get("spread_size_max"))
-    if size_min_raw is None and size_max_raw is None:
-        spread_size_min = spread_size_max = spread_size_fixed
-    else:
-        spread_size_min = _parse_order_size(
-            "spread_size_min",
-            size_min_raw if size_min_raw is not None else spread_size_fixed,
-            spread_size_fixed,
-        )
-        spread_size_max = _parse_order_size(
-            "spread_size_max",
-            size_max_raw if size_max_raw is not None else spread_size_fixed,
-            spread_size_fixed,
-        )
-    max_order = _parse_order_size(
-        "max_order_size",
-        raw.get("max_order_size", defaults.get("max_order_size")),
-        float(defaults.get("max_order_size", 10.0)),
-    )
-    max_shares = _parse_max_shares(
-        "max_shares",
-        raw.get("max_shares", defaults.get("max_shares")),
-        float(defaults.get("max_shares", 10.2)),
-    )
 
     if ENV_SIZING_OVERRIDES:
-        spread_size_min = ENV_SIZING_OVERRIDES["spread_size_min"]
-        spread_size_max = ENV_SIZING_OVERRIDES["spread_size_max"]
-        max_shares = ENV_SIZING_OVERRIDES["max_shares"]
-        if "max_order_size" in ENV_SIZING_OVERRIDES:
-            max_order = ENV_SIZING_OVERRIDES["max_order_size"]
+        momentum_size = ENV_SIZING_OVERRIDES["momentum_size"]
+        momentum_max_shares = ENV_SIZING_OVERRIDES["momentum_max_shares"]
 
-    if spread_size_min > spread_size_max:
+    if momentum_size > momentum_max_shares:
         _fatal(
-            f"{asset}:{window}: spread_size_min ({spread_size_min}) "
-            f"cannot exceed spread_size_max ({spread_size_max})"
+            f"{asset}:{window}: momentum_size ({momentum_size}) "
+            f"cannot exceed momentum_max_shares ({momentum_max_shares})"
         )
-    max_order = max(max_order, spread_size_max)
-    if max_order > max_shares:
-        _fatal(
-            f"{asset}:{window}: max_order_size ({max_order}) "
-            f"cannot exceed max_shares ({max_shares})"
-        )
-
-    price_bias = _parse_spread_threshold(
-        "price_bias",
-        raw.get("price_bias", defaults.get("price_bias")),
-        float(defaults.get("price_bias", 0.01)),
-    )
 
     dr_raw = raw.get("dry_run", defaults.get("dry_run"))
     if dr_raw is None:
@@ -303,13 +280,12 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     return WorkerConfig(
         asset=asset,
         window=window,
-        spread_threshold=spread_threshold,
+        momentum_lookback_ms=momentum_lookback_ms,
+        momentum_min_delta=momentum_min_delta,
+        momentum_mode=momentum_mode,
+        momentum_size=momentum_size,
+        momentum_max_shares=momentum_max_shares,
         trade_cooldown_ms=trade_cooldown_ms,
-        spread_size_min=spread_size_min,
-        spread_size_max=spread_size_max,
-        max_order_size=max_order,
-        max_shares=max_shares,
-        price_bias=price_bias,
         dry_run=dry_run,
         dry_run_fill_delay_min_ms=dry_min,
         dry_run_fill_delay_max_ms=dry_max,
@@ -435,17 +411,16 @@ print(f"🧪 DRY_RUN_DEFAULT={DRY_RUN_DEFAULT}")
 if WORKER_CONFIGS:
     wc0 = WORKER_CONFIGS[0]
     if ENV_SIZING_OVERRIDES:
-        size_label = (
-            f"{wc0.spread_size_min}-{wc0.spread_size_max} random"
-            if wc0.random_order_size
-            else str(wc0.spread_size_max)
-        )
         print(
-            f"📐 Sizing (.env override): order={size_label} | "
-            f"max_order={wc0.max_order_size} | max_shares={wc0.max_shares}"
+            f"📐 Sizing (.env override): size={wc0.momentum_size} | "
+            f"max_shares={wc0.momentum_max_shares}"
         )
     else:
         print(
-            f"📐 Sizing (trading_config.json): order={wc0.spread_size_max} fixed | "
-            f"max_order={wc0.max_order_size} | max_shares={wc0.max_shares}"
+            f"📐 Sizing (trading_config.json): size={wc0.momentum_size} | "
+            f"max_shares={wc0.momentum_max_shares}"
         )
+    print(
+        f"📈 Momentum: lookback={wc0.momentum_lookback_ms}ms | "
+        f"min_Δ={wc0.momentum_min_delta:.4f} | mode={wc0.momentum_mode}"
+    )

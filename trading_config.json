@@ -1,11 +1,11 @@
 {
   "defaults": {
-    "spread_threshold": 0.03,
+    "momentum_lookback_ms": 3000,
+    "momentum_min_delta": 0.0015,
+    "momentum_mode": "single_taker",
+    "momentum_size": 5.1,
+    "momentum_max_shares": 5.1,
     "trade_cooldown_ms": 3000,
-    "spread_size": 5.1,
-    "max_order_size": 5.1,
-    "max_shares": 5.1,
-    "price_bias": 0.01,
     "dry_run": null,
     "dry_run_fill_delay_min_ms": 200,
     "dry_run_fill_delay_max_ms": 2500,

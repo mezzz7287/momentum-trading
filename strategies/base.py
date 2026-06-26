@@ -1,4 +1,4 @@
-"""Strategy protocol for spread capture."""
+"""Strategy protocol for momentum trading."""
 
 from __future__ import annotations
 
@@ -8,22 +8,22 @@ from typing import TYPE_CHECKING, Literal, Optional, Protocol
 if TYPE_CHECKING:
     from bot import MarketWorker
 
-SpreadMode = Literal["dual", "rebalance"]
+MomentumMode = Literal["single_taker", "gtc_at_ask", "single_maker", "dual_hybrid"]
 
 
 @dataclass(frozen=True)
-class SpreadDecision:
-    yes_price: float
-    no_price: float
+class MomentumDecision:
+    side: str
+    price: float
     size: float
-    edge: float
-    mode: SpreadMode = "dual"
-    rebalance_side: Optional[str] = None
+    signal_delta: float
+    mode: MomentumMode
+    signal_direction: str = "UP"
 
 
-class SpreadStrategyProtocol(Protocol):
-    async def evaluate(self, worker: "MarketWorker") -> Optional[SpreadDecision]:
+class MomentumStrategyProtocol(Protocol):
+    async def evaluate(self, worker: "MarketWorker") -> Optional[MomentumDecision]:
         ...
 
-    async def execute(self, worker: "MarketWorker", decision: SpreadDecision) -> None:
+    async def execute(self, worker: "MarketWorker", decision: MomentumDecision) -> None:
         ...

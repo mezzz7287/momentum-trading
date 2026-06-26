@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import threading
 import requests  # type: ignore
@@ -48,9 +47,8 @@ from config import (
     validate_trading_assets,
     worker_key,
 )
-from strategies.base import SpreadDecision
-from strategies.spread_capture import SpreadCaptureStrategy
-from utils.spread_inventory import SpreadInventory
+from binance_feed import get_momentum_status, start_binance_feed, stop_binance_feed
+from strategies.momentum import MomentumStrategy
 from utils.clob_helpers import clamp_buy_price, clamp_sell_price, parse_order_type
 
 console = Console()
@@ -155,10 +153,6 @@ LOCKED_LOW  = 0.01  # 1c  — market resolved or buy-side liquidity exhausted
 LOCKED_HIGH = 1.00  # 100c — market fully resolved
 
 FINAL_PRICE   = float(os.getenv("FINAL_PRICE", "0.70"))
-
-BINANCE_PRIME_THRESHOLD   = float(os.getenv("BINANCE_PRIME_THRESHOLD",   "0.20"))
-BINANCE_STALE_CUTOFF_SECS = float(os.getenv("BINANCE_STALE_CUTOFF_SECS", "5.0"))
-BINANCE_DEPTH_LIMIT       = int(os.getenv("BINANCE_DEPTH_LIMIT",          "20"))
 
 MIN_FILL_DELTA   = float(os.getenv("MIN_FILL_DELTA",   "0.05"))
 
@@ -434,7 +428,7 @@ class TradeState(Enum):
     ERROR   = auto()
 
 
-class SpreadState(Enum):
+class MomentumState(Enum):
     IDLE    = auto()
     PENDING = auto()
 
@@ -1745,20 +1739,18 @@ def trade_history_backfill() -> int:
 
 def collect_open_positions(workers: List["MarketWorker"]) -> List[Dict]:
     """
-    Return one snapshot per open position (FILLED state only).
-    Duplicate ids are suppressed — at most one row per asset/market round.
+    Return one snapshot per open leg (YES/NO shares held).
+    Duplicate ids are suppressed — at most one row per asset/market/side.
     """
     seen: set = set()
     out: List[Dict] = []
     for worker in workers:
-        snap = worker.get_position_snapshot()
-        if not snap:
-            continue
-        pid = snap["id"]
-        if pid in seen:
-            continue
-        seen.add(pid)
-        out.append(snap)
+        for snap in worker.get_position_snapshots():
+            pid = snap["id"]
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(snap)
     return out
 
 
@@ -1780,98 +1772,6 @@ def find_worker_by_asset(workers: List["MarketWorker"], asset: str) -> Optional[
         if worker.asset_type == key:
             return worker
     return None
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# BINANCE DEPTH SIGNAL  (display / context only — not a trade gate)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class BinanceDepthSignal:
-    _instances: Dict[str, "BinanceDepthSignal"] = {}
-    _instance_lock = asyncio.Lock()
-
-    @classmethod
-    async def get_or_create(cls, symbol: str) -> "BinanceDepthSignal":
-        async with cls._instance_lock:
-            sym = symbol.upper()
-            if sym not in cls._instances:
-                inst = cls(sym)
-                cls._instances[sym] = inst
-                asyncio.create_task(inst._run())
-            return cls._instances[sym]
-
-    def __init__(self, symbol: str):
-        self.symbol      = symbol
-        self.imbalance   = 0.0
-        self.momentum    = 0.0
-        self.last_update = 0.0
-        self._history: deque = deque(maxlen=8)
-        self._running    = False
-
-    @property
-    def is_fresh(self) -> bool:
-        return (t.time() - self.last_update) < BINANCE_STALE_CUTOFF_SECS
-
-    @property
-    def is_primed(self) -> bool:
-        return self.is_fresh and abs(self.imbalance) >= BINANCE_PRIME_THRESHOLD
-
-    @property
-    def signal_label(self) -> str:
-        if not self.is_fresh:
-            return "STALE"
-        if abs(self.imbalance) >= BINANCE_PRIME_THRESHOLD:
-            return "STRONGLY BULL ↑" if self.imbalance > 0 else "STRONGLY BEAR ↓"
-        if abs(self.imbalance) >= 0.10:
-            return "MILDLY BULL ↑"   if self.imbalance > 0 else "MILDLY BEAR ↓"
-        return "NEUTRAL"
-
-    async def _run(self):
-        if self._running:
-            return
-        self._running = True
-        stream = f"{self.symbol.lower()}usdt@depth{BINANCE_DEPTH_LIMIT}@100ms"
-        url    = f"wss://fstream.binance.com/stream?streams={stream}"
-        while True:
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=15) as ws:
-                    print(f"📡 [Binance WS] Connected: {stream}")
-                    async for raw in ws:
-                        msg  = json.loads(raw)
-                        data = msg.get("data", msg)
-                        bids = data.get("b", [])
-                        asks = data.get("a", [])
-                        if bids and asks:
-                            self._process(bids, asks)
-            except Exception as e:
-                print(f"⚠️ [Binance WS] {self.symbol}: {e} — reconnecting in 3s")
-                await asyncio.sleep(3)
-
-    def _process(self, bids: list, asks: list):
-        def weighted_vol(levels: list) -> float:
-            tw = tv = 0.0
-            for i, item in enumerate(levels[:20]):
-                qty = float(item[1])
-                w   = 1.0 / (i + 1) ** 0.6
-                tv += qty * w
-                tw += w
-            return tv / tw if tw > 0 else 0.0
-
-        bid_v = weighted_vol(bids)
-        ask_v = weighted_vol(asks)
-        total = bid_v + ask_v
-        if total <= 0:
-            return
-        raw = (bid_v - ask_v) / total
-        self._history.append(raw)
-        self.last_update = t.time()
-        if len(self._history) >= 4:
-            recent         = list(self._history)[-4:]
-            self.imbalance = sum(recent) / len(recent)
-            self.momentum  = recent[-1] - recent[0]
-        else:
-            self.imbalance = raw
-            self.momentum  = 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2277,19 +2177,24 @@ class MarketWorker:
         self.start_delay_met   = False
         self.market_start_time: Optional[float] = None
 
-        self.dummy_balance  = float(worker_config.spread_size)
+        self.dummy_balance  = float(worker_config.momentum_size)
         self.last_trade_time = 0
         self.logged_markets  = set()
 
-        self.spread_state: SpreadState = SpreadState.IDLE
-        self.spread_inventory = SpreadInventory()
-        self.spread_captures = 0
+        self.momentum_state: MomentumState = MomentumState.IDLE
+        self.momentum_trades = 0
+        self.yes_shares = 0.0
+        self.no_shares = 0.0
+        self.yes_cost = 0.0
+        self.no_cost = 0.0
+        self.last_momentum_delta = 0.0
+        self.last_momentum_signal: Optional[str] = None
+        self.momentum_feed_fresh = False
 
         self.last_yes_update = 0.0
         self.last_no_update  = 0.0
 
         self.price_history: deque = deque(maxlen=30)
-        self.binance = None
 
         self.market_outcome  = None
         self.final_yes_price = 0.0
@@ -2311,15 +2216,13 @@ class MarketWorker:
             "listener":           "--:--",
             "status":             "WAITING",
             "outcome":            "PENDING",
-            "combined_bid_c":     0,
-            "spread_edge":        0.0,
-            "yes_bid_c":          0,
-            "no_bid_c":           0,
+            "momentum_delta_pct": 0.0,
+            "momentum_signal":    None,
+            "momentum_mode":      worker_config.momentum_mode,
             "yes_shares":         0.0,
             "no_shares":          0.0,
             "yes_avg_price_c":    0.0,
             "no_avg_price_c":     0.0,
-            "pair_avg_price_c":   0.0,
         }
         self.recent_logs: Deque[str] = deque(maxlen=4)
 
@@ -2327,7 +2230,7 @@ class MarketWorker:
         self._cashout_in_progress: bool = False
         self._history_exit_action: str = "sell"
 
-        self.strategy = SpreadCaptureStrategy()
+        self.strategy = MomentumStrategy()
 
         _register_worker(self)
 
@@ -2433,12 +2336,122 @@ class MarketWorker:
         self.recent_logs.append(f"[{timestamp}] {message}")
 
     def update_dashboard(self):
-        inv = self.spread_inventory
         self.dashboard["outcome"] = self.market_outcome or "PENDING"
-        if inv.yes_shares > 0 or inv.no_shares > 0:
-            self.dashboard["status"] = (
-                f"SPREAD Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
+        if self.yes_shares > 0 or self.no_shares > 0:
+            parts = []
+            if self.yes_shares > 0:
+                parts.append(f"YES {self.yes_shares:.0f}")
+            if self.no_shares > 0:
+                parts.append(f"NO {self.no_shares:.0f}")
+            self.dashboard["status"] = " ".join(parts)
+
+    def _shares(self, side: str) -> float:
+        return self.yes_shares if side == "YES" else self.no_shares
+
+    def _avg_cost(self, side: str) -> float:
+        if side == "YES":
+            return self.yes_cost / self.yes_shares if self.yes_shares > 0 else 0.0
+        return self.no_cost / self.no_shares if self.no_shares > 0 else 0.0
+
+    def momentum_headroom(self, side: str) -> float:
+        return max(0.0, self.worker_config.momentum_max_shares - self._shares(side))
+
+    def momentum_order_size(self, side: str) -> Optional[float]:
+        wc = self.worker_config
+        room = self.momentum_headroom(side)
+        if room < MIN_SHARES:
+            return None
+        size = min(float(wc.momentum_size), room)
+        if size < MIN_SHARES:
+            return None
+        return round(size, 4)
+
+    def validate_momentum_order_size(self, side: str, size: float) -> bool:
+        wc = self.worker_config
+        projected = self._shares(side) + size
+        if size <= 0:
+            print(f"❌ [SIZE CHECK] {side} rejected: size={size} <= 0")
+            return False
+        if projected > wc.momentum_max_shares + 1e-9:
+            print(
+                f"❌ [SIZE CHECK] {side} rejected: projected "
+                f"{projected:.4f} > momentum_max_shares={wc.momentum_max_shares}"
             )
+            exec_log(
+                "momentum_size_rejected", side=side, size=size,
+                reason="momentum_max_shares", projected=projected,
+                asset=self.asset_type, window=self.window_slug,
+            )
+            return False
+        return True
+
+    def _update_momentum_dashboard(self) -> None:
+        wc = self.worker_config
+        status = get_momentum_status(
+            self.asset_type, wc.momentum_lookback_ms, wc.momentum_min_delta,
+        )
+        self.last_momentum_delta = status["delta"]
+        self.last_momentum_signal = status["signal"]
+        self.momentum_feed_fresh = status["fresh"]
+        self.dashboard["momentum_delta_pct"] = status["delta_pct"]
+        self.dashboard["momentum_signal"] = status["signal"]
+        self.dashboard["momentum_feed_fresh"] = status["fresh"]
+        self.dashboard["momentum_min_delta_pct"] = round(wc.momentum_min_delta * 100, 4)
+        self.dashboard["momentum_mode"] = wc.momentum_mode
+        self.dashboard["yes_shares"] = round(self.yes_shares, 2)
+        self.dashboard["no_shares"] = round(self.no_shares, 2)
+        yes_avg = self._avg_cost("YES")
+        no_avg = self._avg_cost("NO")
+        self.dashboard["yes_avg_price_c"] = round(yes_avg * 100, 1) if self.yes_shares > 0 else 0.0
+        self.dashboard["no_avg_price_c"] = round(no_avg * 100, 1) if self.no_shares > 0 else 0.0
+
+    def record_momentum_fill(self, side: str, size: float, price: float) -> None:
+        if size <= 0 or price <= 0:
+            return
+        self.momentum_trades += 1
+        cost = size * price
+        if side == "YES":
+            self.yes_shares += size
+            self.yes_cost += cost
+        else:
+            self.no_shares += size
+            self.no_cost += cost
+        self.log_trade(side, price, "buy", size=size)
+        self._update_momentum_dashboard()
+        msg = (
+            f"[MOMENTUM] {side} fill {size:.2f}@{round(price*100)}c | "
+            f"Y={self.yes_shares:.1f} N={self.no_shares:.1f}"
+        )
+        self.log_to_file(msg)
+        self.add_log(msg[:120])
+
+    def get_unrealized_pnl(self) -> Tuple[float, float]:
+        if self.yes_shares <= MIN_FILL_DELTA and self.no_shares <= MIN_FILL_DELTA:
+            return 0.0, 0.0
+
+        matched = min(self.yes_shares, self.no_shares)
+        yes_unpaired = max(0.0, self.yes_shares - matched)
+        no_unpaired = max(0.0, self.no_shares - matched)
+        yes_bid = self.bids.get("YES", 0.0)
+        no_bid = self.bids.get("NO", 0.0)
+
+        mark_value = (
+            matched * 1.0
+            + yes_unpaired * yes_bid
+            + no_unpaired * no_bid
+        )
+        total_cost = self.yes_cost + self.no_cost
+        unrealized = mark_value - total_cost
+        roi_pct = (unrealized / total_cost * 100) if total_cost > 0 else 0.0
+        return round(unrealized, 4), round(roi_pct, 2)
+
+    def get_current_pnl(self) -> Tuple[float, float, str]:
+        pnl_dollars, pnl_pct = self.get_unrealized_pnl()
+        if pnl_dollars == 0.0 and pnl_pct == 0.0:
+            if self.yes_shares <= MIN_FILL_DELTA and self.no_shares <= MIN_FILL_DELTA:
+                return 0.0, 0.0, "white"
+        color = "red" if pnl_dollars < 0 else "green"
+        return pnl_dollars, pnl_pct, color
 
     def get_listener_countdown(self) -> str:
         if not self.active_market:
@@ -2455,310 +2468,6 @@ class MarketWorker:
 
     def is_dry_run(self) -> bool:
         return self.worker_config.dry_run
-
-    def spread_order_size(self, legs: List[str]) -> Optional[float]:
-        """Pick order size (random in configured range) and clamp to headroom."""
-        wc = self.worker_config
-        if wc.random_order_size:
-            target = random.uniform(wc.spread_size_min, wc.spread_size_max)
-            target = round(target, 1)
-        else:
-            target = float(wc.spread_size_max)
-        per_leg: List[float] = []
-        for side in legs:
-            room = self.spread_inventory.headroom(side, wc.max_shares)
-            if room < MIN_SHARES:
-                return None
-            per_leg.append(min(target, room, float(wc.max_order_size)))
-        size = min(per_leg)
-        if size < MIN_SHARES:
-            return None
-        return round(size, 4)
-
-    def validate_spread_order_size(self, side: str, size: float) -> bool:
-        wc = self.worker_config
-        inv = self.spread_inventory
-        projected = inv.shares(side) + size
-        if size <= 0:
-            print(f"❌ [SIZE CHECK] {side} rejected: size={size} <= 0")
-            return False
-        if size > wc.max_order_size + 1e-9:
-            print(
-                f"❌ [SIZE CHECK] {side} rejected: size={size} "
-                f"> max_order_size={wc.max_order_size}"
-            )
-            exec_log(
-                "spread_size_rejected", side=side, size=size,
-                reason="max_order_size", asset=self.asset_type, window=self.window_slug,
-            )
-            return False
-        if projected > wc.max_shares + 1e-9:
-            print(
-                f"❌ [SIZE CHECK] {side} rejected: projected inventory "
-                f"{projected:.4f} > max_shares={wc.max_shares} "
-                f"(current={inv.shares(side):.4f}, order={size:.4f})"
-            )
-            exec_log(
-                "spread_size_rejected", side=side, size=size,
-                reason="max_shares", projected=projected,
-                asset=self.asset_type, window=self.window_slug,
-            )
-            return False
-        return True
-
-    def _update_spread_dashboard(self) -> None:
-        up_bid = self.bids.get("YES", 0.0)
-        down_bid = self.bids.get("NO", 0.0)
-        combined = (up_bid + down_bid) if up_bid > 0 and down_bid > 0 else 0.0
-        edge = round(1.0 - combined, 4) if combined > 0 else 0.0
-        inv = self.spread_inventory
-        self.dashboard["combined_bid_c"] = round(combined * 100)
-        self.dashboard["spread_edge"] = edge
-        self.dashboard["yes_bid_c"] = round(up_bid * 100)
-        self.dashboard["no_bid_c"] = round(down_bid * 100)
-        self.dashboard["yes_shares"] = round(inv.yes_shares, 2)
-        self.dashboard["no_shares"] = round(inv.no_shares, 2)
-        yes_avg = inv.avg_cost("YES")
-        no_avg = inv.avg_cost("NO")
-        self.dashboard["yes_avg_price"] = round(yes_avg, 4)
-        self.dashboard["no_avg_price"] = round(no_avg, 4)
-        self.dashboard["yes_avg_price_c"] = round(yes_avg * 100, 1) if inv.yes_shares > 0 else 0.0
-        self.dashboard["no_avg_price_c"] = round(no_avg * 100, 1) if inv.no_shares > 0 else 0.0
-        if inv.yes_shares > 0 and inv.no_shares > 0:
-            self.dashboard["pair_avg_price_c"] = round((yes_avg + no_avg) * 100, 1)
-        else:
-            self.dashboard["pair_avg_price_c"] = 0.0
-        if inv.yes_shares > 0 or inv.no_shares > 0:
-            self.dashboard["status"] = (
-                f"SPREAD Y{inv.yes_shares:.0f}/N{inv.no_shares:.0f}"
-            )
-
-    def _spread_rebalance_decision(
-        self,
-        *,
-        underweight: str,
-        up_bid: float,
-        down_bid: float,
-        edge: float,
-        size: int,
-    ) -> SpreadDecision:
-        bias = self.worker_config.price_bias
-        if underweight == "YES":
-            ask = self.prices.get("YES", 1.0)
-            yes_px = round(up_bid + bias, 2)
-            if ask > 0.02:
-                yes_px = min(yes_px, round(ask - 0.01, 2))
-            return SpreadDecision(
-                yes_price=yes_px,
-                no_price=0.0,
-                size=size,
-                edge=edge,
-                mode="rebalance",
-                rebalance_side="YES",
-            )
-        ask = self.prices.get("NO", 1.0)
-        no_px = round(down_bid + bias, 2)
-        if ask > 0.02:
-            no_px = min(no_px, round(ask - 0.01, 2))
-        return SpreadDecision(
-            yes_price=0.0,
-            no_price=no_px,
-            size=size,
-            edge=edge,
-            mode="rebalance",
-            rebalance_side="NO",
-        )
-
-    def _log_spread_capture(
-        self,
-        decision: SpreadDecision,
-        *,
-        dry_run: bool = False,
-        fills: Optional[Dict[str, Tuple[float, float]]] = None,
-    ) -> None:
-        if not fills:
-            return
-        self.spread_captures += 1
-        inv = self.spread_inventory
-        mode = "DRY" if dry_run else "LIVE"
-        fill_parts = []
-        if fills:
-            for side, (sz, px) in fills.items():
-                fill_parts.append(f"{side}={sz:.2f}@{round(px*100)}c")
-        fill_str = " ".join(fill_parts) if fill_parts else "simulated"
-        msg = (
-            f"[SPREAD {mode}] {decision.mode} edge={decision.edge:.4f} "
-            f"size={decision.size} | {fill_str} | "
-            f"inv Y={inv.yes_shares:.1f} N={inv.no_shares:.1f}"
-        )
-        self.log_to_file(msg)
-        self.add_log(msg[:120])
-
-    async def place_spread_gtc(
-        self, side: str, price: float, size: float,
-    ) -> Tuple[Optional[str], float]:
-        if not self.validate_spread_order_size(side, float(size)):
-            return None, 0.0
-        ok, order_id, filled = await self.place_order_raw(
-            side, price, size, order_type="GTC",
-        )
-        if not ok:
-            return None, 0.0
-        if filled and order_id:
-            return order_id, float(size)
-        return order_id, 0.0
-
-    def effective_bid(self, side: str) -> float:
-        """Best bid for spread orders; fall back to ask minus bias when bid is stale."""
-        bid = self.bids.get(side, 0.0)
-        if bid > 0:
-            return bid
-        ask = self.prices.get(side, 0.0)
-        if ask > 0:
-            return max(0.01, round(ask - self.worker_config.price_bias, 2))
-        return 0.0
-
-    def resolve_spread_execution_legs(self, decision: SpreadDecision) -> List[Tuple[str, float]]:
-        """Re-read live bids at execution time so fills match the triggering prices."""
-        up_bid = self.effective_bid("YES")
-        down_bid = self.effective_bid("NO")
-        if decision.mode == "dual":
-            return [("YES", round(up_bid, 2)), ("NO", round(down_bid, 2))]
-        if decision.rebalance_side == "YES":
-            reb = self._spread_rebalance_decision(
-                underweight="YES", up_bid=up_bid, down_bid=down_bid,
-                edge=decision.edge, size=decision.size,
-            )
-            return [("YES", reb.yes_price)]
-        if decision.rebalance_side == "NO":
-            reb = self._spread_rebalance_decision(
-                underweight="NO", up_bid=up_bid, down_bid=down_bid,
-                edge=decision.edge, size=decision.size,
-            )
-            return [("NO", reb.no_price)]
-        return []
-
-    @staticmethod
-    def _extract_order_fill_price(info: Dict[str, Any], limit_price: float) -> float:
-        for key in ("avg_price", "average_price", "fill_price", "price"):
-            raw = info.get(key)
-            if raw is None:
-                continue
-            try:
-                px = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if px > 1.0:
-                px /= 100.0
-            if px > 0:
-                return round(px, 4)
-        return round(limit_price, 4)
-
-    async def poll_order_fill(
-        self, order_id: str, requested: float, limit_price: float,
-    ) -> Tuple[float, float]:
-        """Return (filled_size, fill_price). fill_price falls back to limit_price."""
-        try:
-            info = self.account.get_order_status(order_id)
-            if isinstance(info, str):
-                info = json.loads(info)
-            if isinstance(info, dict):
-                matched = (
-                    info.get("size_matched")
-                    or info.get("sizeMatched")
-                    or info.get("matched_size")
-                    or 0
-                )
-                fill_size = min(float(matched), float(requested))
-                if fill_size > 0:
-                    fill_price = self._extract_order_fill_price(info, limit_price)
-                    return fill_size, fill_price
-        except Exception:
-            pass
-        return 0.0, round(limit_price, 4)
-
-    def log_spread_capture_trades(
-        self,
-        *,
-        mode: str,
-        fills: Dict[str, Tuple[float, float]],
-    ) -> None:
-        """Persist one history row per capture with actual fill prices."""
-        if not fills:
-            return
-        market_name = (
-            self.active_market["question"] if self.active_market else "Unknown Market"
-        )
-        slug = (
-            (self.active_market.get("slug") if self.active_market else None)
-            or self.market_slug
-            or self.asset_type
-        )
-        ts_ms = int(t.time() * 1000)
-
-        if mode == "dual" and "YES" in fills and "NO" in fills:
-            yes_sz, yes_px = fills["YES"]
-            no_sz, no_px = fills["NO"]
-            append_trade_history({
-                "asset":       self.asset_type.upper(),
-                "window":      self.window_slug,
-                "market":      market_name,
-                "slug":        slug,
-                "action":      "buy",
-                "side":        "SPREAD",
-                "price":       round(yes_px + no_px, 4),
-                "size":        round(min(yes_sz, no_sz), 4),
-                "timestamp_ms": ts_ms,
-                "yes_price":   round(yes_px, 4),
-                "no_price":    round(no_px, 4),
-                "yes_size":    round(yes_sz, 4),
-                "no_size":     round(no_sz, 4),
-            })
-            return
-
-        for side, (fill_size, fill_price) in fills.items():
-            append_trade_history({
-                "asset":       self.asset_type.upper(),
-                "window":      self.window_slug,
-                "market":      market_name,
-                "slug":        slug,
-                "action":      "buy",
-                "side":        side,
-                "price":       round(fill_price, 4),
-                "size":        round(fill_size, 4),
-                "timestamp_ms": ts_ms,
-            })
-
-    def get_spread_unrealized_pnl(self) -> Tuple[float, float]:
-        """Mark-to-market for spread inventory (matched pairs @ $1, unpaired @ bid)."""
-        inv = self.spread_inventory
-        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-            return 0.0, 0.0
-
-        matched = inv.matched_pairs
-        yes_unpaired = max(0.0, inv.yes_shares - matched)
-        no_unpaired = max(0.0, inv.no_shares - matched)
-        yes_bid = self.bids.get("YES", 0.0)
-        no_bid = self.bids.get("NO", 0.0)
-
-        mark_value = (
-            matched * 1.0
-            + yes_unpaired * yes_bid
-            + no_unpaired * no_bid
-        )
-        total_cost = inv.yes_cost + inv.no_cost
-        unrealized = mark_value - total_cost
-        roi_pct = (unrealized / total_cost * 100) if total_cost > 0 else 0.0
-        return round(unrealized, 4), round(roi_pct, 2)
-
-    def get_current_pnl(self) -> Tuple[float, float, str]:
-        pnl_dollars, pnl_pct = self.get_spread_unrealized_pnl()
-        if pnl_dollars == 0.0 and pnl_pct == 0.0:
-            inv = self.spread_inventory
-            if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-                return 0.0, 0.0, "white"
-        color = "red" if pnl_dollars < 0 else "green"
-        return pnl_dollars, pnl_pct, color
 
     def log_to_file(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2935,7 +2644,7 @@ class MarketWorker:
     # ═════════════════════════════════════════════════════════════════════
 
     async def check_logic(self, timer: str):
-        """Spread capture entry — evaluates edge every tick."""
+        """Momentum entry — evaluate Binance signal every tick."""
         y = self.prices.get("YES", 0.0)
         n = self.prices.get("NO",  0.0)
         y_c = round(y * 100) if y > 0 else 0
@@ -2943,16 +2652,16 @@ class MarketWorker:
         self.dashboard["yes"]   = y_c
         self.dashboard["no"]    = n_c
         self.dashboard["timer"] = timer
-        self._update_spread_dashboard()
+        self._update_momentum_dashboard()
         self.update_dashboard()
 
         if y <= 0 or n <= 0:
             return
 
-        await self._check_spread_logic(y_c, n_c)
+        await self._check_momentum_logic(y_c, n_c)
 
-    async def _check_spread_logic(self, y_c: int, n_c: int) -> None:
-        if self.spread_state == SpreadState.PENDING:
+    async def _check_momentum_logic(self, y_c: int, n_c: int) -> None:
+        if self.momentum_state == MomentumState.PENDING:
             return
         if self._order_lock.locked():
             return
@@ -2967,36 +2676,36 @@ class MarketWorker:
             )
             return
 
-        inv = self.spread_inventory
-        at_cap = (
-            inv.headroom("YES", self.worker_config.max_shares) < MIN_SHARES
-            and inv.headroom("NO", self.worker_config.max_shares) < MIN_SHARES
-        )
-        if at_cap:
+        wc = self.worker_config
+        yes_room = self.momentum_headroom("YES")
+        no_room = self.momentum_headroom("NO")
+        if yes_room < MIN_SHARES and no_room < MIN_SHARES:
             return
 
         decision = await self.strategy.evaluate(self)
         if decision:
-            mode = decision.mode.upper()
             print(
-                f"[SPREAD] {self.asset_type.upper()} {self.window_slug} | "
-                f"{mode} edge={decision.edge:.4f} size={decision.size}"
+                f"[MOMENTUM] {self.asset_type.upper()} {self.window_slug} | "
+                f"{decision.signal_direction} Δ={decision.signal_delta*100:.3f}% "
+                f"→ {decision.side} size={decision.size} mode={decision.mode}"
             )
             async with self._order_lock:
-                if self.spread_state != SpreadState.IDLE:
+                if self.momentum_state != MomentumState.IDLE:
                     return
                 await self.strategy.execute(self, decision)
             return
 
-        comb = self.dashboard.get("combined_bid_c", 0)
-        edge = self.dashboard.get("spread_edge", 0.0)
-        thr = self.worker_config.spread_threshold
-        inv = self.spread_inventory
+        sig = self.last_momentum_signal or "—"
+        delta_pct = self.dashboard.get("momentum_delta_pct", 0.0)
+        thr_pct = round(wc.momentum_min_delta * 100, 3)
+        fresh = "fresh" if self.momentum_feed_fresh else "stale"
         print(
             f"⏳ [IDLE] {self.asset_type.upper()} {self.window_slug} | "
-            f"YES={y_c}c NO={n_c}c | bids={comb}c edge={edge:.4f} "
-            f"(need>{thr:.4f}) | inv Y={inv.yes_shares:.0f} N={inv.no_shares:.0f} "
-            f"caps={self.spread_captures}"
+            f"YES={y_c}c NO={n_c}c | signal={sig} Δ={delta_pct:.3f}% "
+            f"(need>{thr_pct}%) [{fresh}] | "
+            f"Y={self.yes_shares:.0f}/{wc.momentum_max_shares} "
+            f"N={self.no_shares:.0f}/{wc.momentum_max_shares} "
+            f"trades={self.momentum_trades}"
         )
 
     # ── Order execution ────────────────────────────────────────────────
@@ -3017,7 +2726,7 @@ class MarketWorker:
                     else self.active_market["no_id"])
         clean_price = max(0.01, min(0.99, round(price, 2)))
 
-        if not self.validate_spread_order_size(side, float(size)):
+        if not self.validate_momentum_order_size(side, float(size)):
             return False, None, False
 
         if self.is_dry_run():
@@ -3085,49 +2794,45 @@ class MarketWorker:
         """Merge YES+NO shares back into pUSD on-chain for this worker's active market."""
         return await self.account.merge_shares(self.active_market, amount_to_merge)
 
-    def get_position_snapshot(self) -> Optional[Dict]:
-        """Live spread inventory row for the dashboard Positions tab."""
-        inv = self.spread_inventory
-        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-            return None
+    def get_position_snapshots(self) -> List[Dict]:
+        """Live momentum position rows for the dashboard Positions tab."""
         slug = ((self.active_market.get("slug") if self.active_market else None)
                 or self.market_slug or self.asset_type)
         market_name = ((self.active_market.get("question") if self.active_market else None)
                        or f"{self.asset_type.upper()} Up or Down")
-        pnl_dollars, pnl_pct = self.get_spread_unrealized_pnl()
-        total_cost = inv.yes_cost + inv.no_cost
-        yes_avg_c = round(inv.avg_cost("YES") * 100, 1) if inv.yes_shares > 0 else 0.0
-        no_avg_c = round(inv.avg_cost("NO") * 100, 1) if inv.no_shares > 0 else 0.0
-        pair_avg_c = (
-            round((inv.avg_cost("YES") + inv.avg_cost("NO")) * 100, 1)
-            if inv.matched_pairs > 0 else 0.0
-        )
-        return {
-            "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:spread",
-            "asset":               self.asset_type.upper(),
-            "window":              self.window_slug,
-            "market":              market_name,
-            "slug":                slug,
-            "side":                "SPREAD",
-            "strategy":            "spread_capture",
-            "yes_shares":          round(inv.yes_shares, 4),
-            "no_shares":           round(inv.no_shares, 4),
-            "yes_avg_price_c":     yes_avg_c,
-            "no_avg_price_c":      no_avg_c,
-            "pair_avg_price_c":    pair_avg_c,
-            "matched_pairs":       round(inv.matched_pairs, 4),
-            "spread_imbalance":    round(inv.imbalance, 4),
-            "entry_price":         round(inv.avg_cost("YES") + inv.avg_cost("NO"), 4)
-                                   if inv.matched_pairs > 0 else 0.0,
-            "current_price":       0.0,
-            "entry_price_cents":   pair_avg_c,
-            "current_price_cents": 100.0 if inv.matched_pairs > 0 else 0.0,
-            "roi_pct":             pnl_pct,
-            "unrealized_pnl":      pnl_dollars,
-            "size":                round(inv.yes_shares + inv.no_shares, 4),
-            "size_usd":            round(total_cost, 2),
-            "cashout_available":   False,
-        }
+        snaps: List[Dict] = []
+        for side in ("YES", "NO"):
+            shares = self._shares(side)
+            if shares <= MIN_FILL_DELTA:
+                continue
+            avg = self._avg_cost(side)
+            mark = self.bids.get(side, 0.0) or self.prices.get(side, 0.0)
+            cost = shares * avg
+            unrealized = shares * mark - cost
+            roi_pct = (unrealized / cost * 100) if cost > 0 else 0.0
+            snaps.append({
+                "id":                  f"{self.asset_type}:{self.window_slug}:{slug}:{side.lower()}",
+                "asset":               self.asset_type.upper(),
+                "window":              self.window_slug,
+                "market":              market_name,
+                "slug":                slug,
+                "side":                side,
+                "strategy":            "momentum",
+                "entry_price":         round(avg, 4),
+                "current_price":       round(mark, 4),
+                "entry_price_cents":   round(avg * 100, 1),
+                "current_price_cents": round(mark * 100, 1),
+                "roi_pct":             round(roi_pct, 2),
+                "unrealized_pnl":      round(unrealized, 4),
+                "size":                round(shares, 4),
+                "size_usd":            round(cost, 2),
+                "cashout_available":   False,
+            })
+        return snaps
+
+    def get_position_snapshot(self) -> Optional[Dict]:
+        snaps = self.get_position_snapshots()
+        return snaps[0] if snaps else None
 
     # ── State reset ────────────────────────────────────────────────────
 
@@ -3157,20 +2862,21 @@ class MarketWorker:
         self.dashboard["profit"]            = 0.0
         self.dashboard["price_delta"]       = 0.0
         self.dashboard["signal_stale"]      = True
-        self.dashboard["combined_bid_c"]    = 0
-        self.dashboard["spread_edge"]       = 0.0
-        self.dashboard["yes_bid_c"]         = 0
-        self.dashboard["no_bid_c"]          = 0
+        self.dashboard["momentum_delta_pct"] = 0.0
+        self.dashboard["momentum_signal"]    = None
+        self.dashboard["momentum_feed_fresh"] = False
         self.dashboard["yes_shares"]        = 0.0
         self.dashboard["no_shares"]         = 0.0
-        self.dashboard["yes_avg_price"]     = 0.0
-        self.dashboard["no_avg_price"]      = 0.0
         self.dashboard["yes_avg_price_c"]   = 0.0
         self.dashboard["no_avg_price_c"]    = 0.0
-        self.dashboard["pair_avg_price_c"]  = 0.0
-        self.spread_state = SpreadState.IDLE
-        self.spread_inventory.reset()
-        self.spread_captures = 0
+        self.momentum_state = MomentumState.IDLE
+        self.momentum_trades = 0
+        self.yes_shares = 0.0
+        self.no_shares = 0.0
+        self.yes_cost = 0.0
+        self.no_cost = 0.0
+        self.last_momentum_delta = 0.0
+        self.last_momentum_signal = None
         self.recent_logs.clear()
         self.update_dashboard()
         print("\n♻️ Full state reset after trade/exit. Ready for next market.")
@@ -3276,29 +2982,20 @@ class MarketWorker:
 
     def get_dashboard_data(self) -> dict:
         pnl_dollars, pnl_pct, _ = self.get_current_pnl()
-        inv = self.spread_inventory
+        wc = self.worker_config
 
-        if inv.yes_shares > 0 or inv.no_shares > 0:
-            leg_parts: List[str] = []
-            yes_cost = 0.0
-            no_cost = 0.0
-            if inv.yes_shares > 0:
-                yes_cost = inv.yes_shares * inv.avg_cost("YES")
-                leg_parts.append(f"YES @ ${yes_cost:.2f}")
-            if inv.no_shares > 0:
-                no_cost = inv.no_shares * inv.avg_cost("NO")
-                leg_parts.append(f"NO @ ${no_cost:.2f}")
-            position_text = " ".join(leg_parts)
-            if inv.yes_shares > 0 and inv.no_shares > 0:
-                position_text += f" (pair=${yes_cost + no_cost:.1f})"
-        else:
-            position_text = "-"
+        leg_parts: List[str] = []
+        if self.yes_shares > 0:
+            leg_parts.append(f"YES {self.yes_shares:.1f}@{self.dashboard.get('yes_avg_price_c', 0):.0f}c")
+        if self.no_shares > 0:
+            leg_parts.append(f"NO {self.no_shares:.1f}@{self.dashboard.get('no_avg_price_c', 0):.0f}c")
+        position_text = " ".join(leg_parts) if leg_parts else "-"
 
-        spread_status = (
-            "PENDING" if self.spread_state == SpreadState.PENDING else "HUNTING"
+        momentum_status = (
+            "PENDING" if self.momentum_state == MomentumState.PENDING else "HUNTING"
         )
-        if inv.yes_shares > 0 or inv.no_shares > 0:
-            spread_status = f"INVENTORY {spread_status}"
+        if self.yes_shares > 0 or self.no_shares > 0:
+            momentum_status = f"POSITION {momentum_status}"
 
         market_start_iso = None
         market_end_iso   = None
@@ -3310,37 +3007,35 @@ class MarketWorker:
 
         cd = asset_cooldown.get_status(self.asset_type, self.window_slug)
         schedule_ok = is_trading_allowed()
-        edge = self.dashboard.get("spread_edge", 0.0)
-        edge_cents = round(edge * 100, 2)
-        thr_cents = round(self.worker_config.spread_threshold * 100, 2)
+        delta_pct = self.dashboard.get("momentum_delta_pct", 0.0)
+        thr_pct = round(wc.momentum_min_delta * 100, 4)
+        signal = self.dashboard.get("momentum_signal")
+        signal_above = signal is not None
 
         return {
             "asset":              self.asset_type.upper(),
             "window":             self.window_slug,
-            "strategy":           "spread_capture",
+            "strategy":           "momentum",
             "yes":                round(self.prices.get("YES", 0) * 100),
             "no":                 round(self.prices.get("NO",  0) * 100),
-            "yes_bid_c":          self.dashboard.get("yes_bid_c", 0),
-            "no_bid_c":           self.dashboard.get("no_bid_c", 0),
-            "combined_bid_c":     self.dashboard.get("combined_bid_c", 0),
-            "spread_edge":        edge,
-            "spread_edge_cents":  edge_cents,
-            "spread_threshold":   self.worker_config.spread_threshold,
-            "spread_threshold_cents": thr_cents,
-            "edge_above_threshold": edge > self.worker_config.spread_threshold,
-            "max_shares":         self.worker_config.max_shares,
+            "momentum_signal":    signal,
+            "momentum_delta_pct": delta_pct,
+            "momentum_min_delta_pct": thr_pct,
+            "signal_above_threshold": signal_above,
+            "momentum_mode":      wc.momentum_mode,
+            "momentum_lookback_ms": wc.momentum_lookback_ms,
+            "momentum_feed_fresh": self.dashboard.get("momentum_feed_fresh", False),
+            "momentum_max_shares": wc.momentum_max_shares,
+            "momentum_size":      wc.momentum_size,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
-            "yes_avg_price":      self.dashboard.get("yes_avg_price", 0.0),
-            "no_avg_price":       self.dashboard.get("no_avg_price", 0.0),
             "yes_avg_price_c":    self.dashboard.get("yes_avg_price_c", 0.0),
             "no_avg_price_c":     self.dashboard.get("no_avg_price_c", 0.0),
-            "pair_avg_price_c":   self.dashboard.get("pair_avg_price_c", 0.0),
-            "spread_captures":    self.spread_captures,
-            "spread_state":       spread_status,
+            "momentum_trades":    self.momentum_trades,
+            "momentum_state":     momentum_status,
             "timer":              self.dashboard.get("timer",    "--:--"),
             "listener":           self.get_listener_countdown(),
-            "status":             spread_status,
+            "status":             momentum_status,
             "position":           position_text,
             "outcome":            self.dashboard.get("outcome", "PENDING"),
             "dry_run":            self.is_dry_run(),
@@ -3377,23 +3072,22 @@ class MarketWorker:
         else:
             self.market_outcome = "UNKNOWN"
         self.dashboard["outcome"] = self.market_outcome
-        self._settle_spread_market()
+        self._settle_momentum_market()
 
-    def _settle_spread_market(self) -> None:
-        inv = self.spread_inventory
+    def _settle_momentum_market(self) -> None:
         outcome = self.market_outcome or "UNKNOWN"
         price_in_cents = lambda p: f"{round(p * 100)}c"
 
-        if inv.yes_shares <= MIN_FILL_DELTA and inv.no_shares <= MIN_FILL_DELTA:
-            print(f"\n{BOLD}{YELLOW}ℹ️  No spread inventory this market "
-                  f"({self.spread_captures} capture attempts).{RESET}")
+        if self.yes_shares <= MIN_FILL_DELTA and self.no_shares <= MIN_FILL_DELTA:
+            print(f"\n{BOLD}{YELLOW}ℹ️  No momentum position this market "
+                  f"({self.momentum_trades} trade attempts).{RESET}")
             self._finish_market_merge()
             return
 
-        matched = inv.matched_pairs
-        yes_unpaired = max(0.0, inv.yes_shares - matched)
-        no_unpaired = max(0.0, inv.no_shares - matched)
-        total_cost = inv.yes_cost + inv.no_cost
+        matched = min(self.yes_shares, self.no_shares)
+        yes_unpaired = max(0.0, self.yes_shares - matched)
+        no_unpaired = max(0.0, self.no_shares - matched)
+        total_cost = self.yes_cost + self.no_cost
 
         settlement = matched * 1.0
         if outcome == "YES":
@@ -3403,13 +3097,13 @@ class MarketWorker:
 
         actual_profit = round(settlement - total_cost, 4)
 
-        print(f"\n\n{BOLD}{GREEN}--- 📊 SPREAD SETTLEMENT ---{RESET}")
+        print(f"\n\n{BOLD}{GREEN}--- 📈 MOMENTUM SETTLEMENT ---{RESET}")
         print(f"⏱️ Market Outcome:      {outcome}")
-        print(f"📦 Captures this round: {self.spread_captures}")
-        print(f"📊 YES shares:          {inv.yes_shares:.4f} "
-              f"(avg {price_in_cents(inv.avg_cost('YES'))})")
-        print(f"📊 NO shares:           {inv.no_shares:.4f} "
-              f"(avg {price_in_cents(inv.avg_cost('NO'))})")
+        print(f"📦 Trades this round:   {self.momentum_trades}")
+        print(f"📊 YES shares:          {self.yes_shares:.4f} "
+              f"(avg {price_in_cents(self._avg_cost('YES'))})")
+        print(f"📊 NO shares:           {self.no_shares:.4f} "
+              f"(avg {price_in_cents(self._avg_cost('NO'))})")
         print(f"🔗 Matched pairs:       {matched:.4f}")
         print(f"📉 Total invested:      ${total_cost:.4f}")
         print(f"💵 Settlement value:    ${settlement:.4f}")
@@ -3423,16 +3117,16 @@ class MarketWorker:
         elif outcome == "NO" and no_unpaired > 0:
             self.log_trade("NO", 1.0, "redeem", size=no_unpaired)
 
-        self.log_pnl("SPREAD_SETTLE", actual_profit, {
+        self.log_pnl("MOMENTUM_SETTLE", actual_profit, {
             "outcome":          outcome,
-            "yes_shares":       inv.yes_shares,
-            "no_shares":        inv.no_shares,
+            "yes_shares":       self.yes_shares,
+            "no_shares":        self.no_shares,
             "matched_pairs":    matched,
             "yes_unpaired":     yes_unpaired,
             "no_unpaired":      no_unpaired,
             "total_cost":       total_cost,
             "settlement_value": settlement,
-            "spread_captures":  self.spread_captures,
+            "momentum_trades":  self.momentum_trades,
         })
         self._finish_market_merge()
 
@@ -3493,21 +3187,15 @@ class MarketWorker:
     async def start(self):
         """Per-worker trading loop for one (asset, window) pair."""
         wc = self.worker_config
-        print(f"🤖 EmilianoBot — SPREAD CAPTURE → "
+        print(f"🤖 EmilianoBot — MOMENTUM → "
               f"{self.asset_type.upper()} {self.window_slug} markets...")
         print(f"  Market interval   : {self.window_slug} ({wc.interval_seconds}s)")
         print(f"  Listener window   : final {wc.listener_activate_secs}s")
-        print(f"  Spread threshold  : {wc.spread_threshold:.4f} ({wc.spread_threshold*100:.1f}c edge)")
-        if wc.random_order_size:
-            order_size_label = (
-                f"{wc.spread_size_min}-{wc.spread_size_max} shares random "
-                f"(max order {wc.max_order_size})"
-            )
-        else:
-            order_size_label = f"{wc.spread_size_max} shares (max order {wc.max_order_size})"
-        print(f"  Order size        : {order_size_label}")
-        print(f"  Max inventory     : {wc.max_shares} shares per leg")
-        print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after dual leg")
+        print(f"  Momentum lookback : {wc.momentum_lookback_ms}ms")
+        print(f"  Min delta         : {wc.momentum_min_delta:.4f} ({wc.momentum_min_delta*100:.2f}%)")
+        print(f"  Execution mode    : {wc.momentum_mode}")
+        print(f"  Order size        : {wc.momentum_size} shares (max {wc.momentum_max_shares}/side)")
+        print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after order")
         if self.is_dry_run():
             print(f"  Dry-run fill delay: {wc.dry_run_fill_delay_min_ms}-"
                   f"{wc.dry_run_fill_delay_max_ms}ms per leg")
@@ -3586,7 +3274,7 @@ def create_dashboard(bots):
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — Spread Capture[/bold cyan]\n"
+                f"[bold cyan]EMILIANO BOT — Momentum Trading[/bold cyan]\n"
                 f"Schedule ({_tz_label}): {_schedule_str}",
                 style="bold green", box=box.ROUNDED,
             ),
@@ -3610,13 +3298,17 @@ def create_dashboard(bots):
             rem = cd.get("cooldown_remaining_sec", 0)
             display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
 
-        edge = d.get("spread_edge", 0.0)
-        comb = d.get("combined_bid_c", 0)
-        ratio_text = (
-            f"[cyan]edge {edge*100:.2f}c[/cyan] "
-            f"(bids {comb}c / need >{bot.worker_config.spread_threshold*100:.1f}c)"
+        delta_pct = d.get("momentum_delta_pct", 0.0)
+        signal = d.get("momentum_signal")
+        thr_pct = d.get("momentum_min_delta_pct", bot.worker_config.momentum_min_delta * 100)
+        mode = d.get("momentum_mode", bot.worker_config.momentum_mode)
+        fresh = d.get("momentum_feed_fresh", False)
+        signal_text = (
+            f"[cyan]{signal} Δ={delta_pct:.3f}%[/cyan] "
+            f"(need >{thr_pct:.3f}%) [{mode}]"
+            if signal else
+            f"[dim]no signal Δ={delta_pct:.3f}% (need >{thr_pct:.3f}%) [{mode}]{' stale' if not fresh else ''}[/dim]"
         )
-        strategy_text = ""
 
         inv_y = d.get("yes_shares", 0)
         inv_n = d.get("no_shares", 0)
@@ -3636,10 +3328,10 @@ def create_dashboard(bots):
         y_avg = d.get("yes_avg_price_c", 0)
         n_avg = d.get("no_avg_price_c", 0)
         bought_text = (
-            f"[dim]spread | "
+            f"[dim]momentum | "
             + (f"Y{inv_y}@{y_avg}c " if inv_y > 0 else "")
             + (f"N{inv_n}@{n_avg}c " if inv_n > 0 else "")
-            + f"| max={bot.worker_config.max_shares}/leg[/dim]"
+            + f"| max={bot.worker_config.momentum_max_shares}/side[/dim]"
         )
 
         cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"
@@ -3654,7 +3346,7 @@ def create_dashboard(bots):
 {bought_text}
 [bold]ROI:[/] [{pnl_color}]+${pnl_dollars:.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]
 [bold]Cooldown PnL:[/] [{cd_pnl_color}]${cd.get('cooldown_window_pnl', 0):+.2f}[/] (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}){cd_blocked}
-[bold]Spread:[/] {ratio_text}{strategy_text}
+[bold]Momentum:[/] {signal_text}
 [bold]Outcome:[/] [bold {'green' if d.get('outcome') == 'YES' else 'red' if d.get('outcome') == 'NO' else 'white'}]{d.get('outcome', 'PENDING')}[/]"""
             ),
             title=f"{d.get('asset', 'UNKNOWN')} · {time_window}",
@@ -3830,25 +3522,27 @@ def merge_all_pnl(send_telegram_notify: bool = False):
 async def main():
     account = AccountService()
 
-    # Global, account-level, one-time startup work — never duplicated below.
     if not account.run_wallet_audit():
         console.print("[bold red]Wallet audit failed — aborting startup.[/bold red]")
         return
     account.start_pnl_merge_scheduler()
 
-    # Per-asset market workers — concurrent, but each is purely market-scoped.
+    await start_binance_feed(w.asset for w in WORKER_CONFIGS)
     bots = [MarketWorker(wc, account) for wc in WORKER_CONFIGS]
 
-    await asyncio.gather(*[bot.start() for bot in bots], dashboard_loop(bots))
+    try:
+        await asyncio.gather(*[bot.start() for bot in bots], dashboard_loop(bots))
+    finally:
+        await stop_binance_feed()
 
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting EmilianoBot — Spread Capture...")
+        print("🚀 Starting EmilianoBot — Momentum Trading...")
         for wc in WORKER_CONFIGS:
-            print(f"   {wc.asset.upper()} {wc.window}: edge>{wc.spread_threshold:.3f} "
-                  f"| order={wc.spread_size} | max={wc.max_shares}/leg "
-                  f"| dry_run={wc.dry_run}")
+            print(f"   {wc.asset.upper()} {wc.window}: Δ>{wc.momentum_min_delta:.4f} "
+                  f"| size={wc.momentum_size} | max={wc.momentum_max_shares}/side "
+                  f"| mode={wc.momentum_mode} | dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[bold yellow]👋 EmilianoBot shutting down...[/bold yellow]")
