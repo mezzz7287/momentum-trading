@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from typing import Deque, Dict, Iterable, Literal, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, Literal, Optional, Tuple
 
 import aiohttp
 
@@ -28,6 +28,7 @@ _tasks: list[asyncio.Task] = []
 _session: Optional[aiohttp.ClientSession] = None
 _running = False
 _lock = asyncio.Lock()
+_MAX_BUFFER_TICKS = 5000
 
 
 def _normalize_asset(asset: str) -> str:
@@ -47,13 +48,51 @@ def _prune(buffer: Deque[Tuple[int, float]], lookback_ms: int, now_ms: int) -> N
         buffer.popleft()
 
 
-def record_price(asset: str, ts_ms: int, price: float) -> None:
+def record_price(asset: str, price: float, *, recv_ms: Optional[int] = None) -> None:
+    """Append one tick; timestamps use local receive time (wall clock)."""
     if price <= 0:
         return
+    ts_ms = recv_ms if recv_ms is not None else int(time.time() * 1000)
     key = _normalize_asset(asset)
     buf = _buffer_for(key)
     buf.append((ts_ms, price))
+    while len(buf) > _MAX_BUFFER_TICKS:
+        buf.popleft()
     _last_update_ms[key] = ts_ms
+
+
+def _parse_agg_trade_payload(raw: Any) -> Optional[float]:
+    """Extract price from raw or combined-stream aggTrade JSON."""
+    if not isinstance(raw, dict):
+        return None
+    event = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+    if not isinstance(event, dict):
+        return None
+    if event.get("e") not in (None, "aggTrade"):
+        return None
+    price_raw = event.get("p")
+    if price_raw is None:
+        return None
+    try:
+        price = float(price_raw)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _decode_ws_message(msg: aiohttp.WSMessage) -> Optional[Any]:
+    if msg.type == aiohttp.WSMsgType.TEXT:
+        raw = msg.data
+    elif msg.type == aiohttp.WSMsgType.BINARY:
+        raw = msg.data.decode("utf-8", errors="replace")
+    else:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 def _window_prices(
@@ -68,8 +107,8 @@ def _window_prices(
     _prune(buf, lookback_ms, now_ms)
     if len(buf) < 2:
         return None
-    oldest_ts, oldest_px = buf[0]
-    newest_ts, newest_px = buf[-1]
+    _oldest_ts, oldest_px = buf[0]
+    _newest_ts, newest_px = buf[-1]
     if oldest_px <= 0 or newest_px <= 0:
         return None
     delta = (newest_px - oldest_px) / oldest_px
@@ -125,18 +164,31 @@ async def _consume_stream(asset: str, symbol: str) -> None:
     url = f"wss://fstream.binance.com/ws/{symbol.lower()}@aggTrade"
     backoff = 1.0
     while _running:
+        first_tick_logged = False
         try:
             assert _session is not None
             async with _session.ws_connect(url, heartbeat=20) as ws:
                 print(f"📡 [Binance Futures] Connected: {symbol}@aggTrade → {asset.upper()}")
                 backoff = 1.0
                 async for msg in ws:
-                    if msg.type != aiohttp.WSMsgType.TEXT:
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                        break
+                    if msg.type == aiohttp.WSMsgType.ERROR:
+                        raise ConnectionError(f"websocket error: {ws.exception()}")
+                    payload = _decode_ws_message(msg)
+                    if payload is None:
                         continue
-                    data = json.loads(msg.data)
-                    price = float(data.get("p", 0))
-                    ts_ms = int(data.get("T", 0))
-                    record_price(asset, ts_ms, price)
+                    price = _parse_agg_trade_payload(payload)
+                    if price is None:
+                        continue
+                    recv_ms = int(time.time() * 1000)
+                    record_price(asset, price, recv_ms=recv_ms)
+                    if not first_tick_logged:
+                        first_tick_logged = True
+                        print(
+                            f"📡 [Binance Futures] {asset.upper()} first tick "
+                            f"price={price} buf={len(_buffer_for(asset))}"
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as e:
