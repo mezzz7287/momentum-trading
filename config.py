@@ -150,6 +150,25 @@ def _load_env_sizing_overrides() -> Optional[dict[str, float]]:
 ENV_SIZING_OVERRIDES: Optional[dict[str, float]] = _load_env_sizing_overrides()
 
 
+def _load_env_momentum_overrides() -> dict[str, float | int]:
+    """Optional per-env momentum tuning (each key independent)."""
+    out: dict[str, float | int] = {}
+    delta_raw = os.getenv("MOMENTUM_MIN_DELTA", "").strip()
+    if delta_raw:
+        out["momentum_min_delta"] = _parse_momentum_delta(
+            "MOMENTUM_MIN_DELTA", delta_raw, 0.0015,
+        )
+    lookback_raw = os.getenv("MOMENTUM_LOOKBACK_MS", "").strip()
+    if lookback_raw:
+        out["momentum_lookback_ms"] = _parse_lookback_ms(
+            "MOMENTUM_LOOKBACK_MS", lookback_raw, 3000,
+        )
+    return out
+
+
+ENV_MOMENTUM_OVERRIDES: dict[str, float | int] = _load_env_momentum_overrides()
+
+
 DRY_RUN_DEFAULT: bool = _parse_bool_env("DRY_RUN_DEFAULT", _parse_bool_env("DRY_MODE", True))
 
 
@@ -229,6 +248,11 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     if ENV_SIZING_OVERRIDES:
         momentum_size = ENV_SIZING_OVERRIDES["momentum_size"]
         momentum_max_shares = ENV_SIZING_OVERRIDES["momentum_max_shares"]
+
+    if "momentum_min_delta" in ENV_MOMENTUM_OVERRIDES:
+        momentum_min_delta = float(ENV_MOMENTUM_OVERRIDES["momentum_min_delta"])
+    if "momentum_lookback_ms" in ENV_MOMENTUM_OVERRIDES:
+        momentum_lookback_ms = int(ENV_MOMENTUM_OVERRIDES["momentum_lookback_ms"])
 
     if momentum_size > momentum_max_shares:
         _fatal(
@@ -422,5 +446,11 @@ if WORKER_CONFIGS:
         )
     print(
         f"📈 Momentum: lookback={wc0.momentum_lookback_ms}ms | "
-        f"min_Δ={wc0.momentum_min_delta:.4f} | mode={wc0.momentum_mode}"
+        f"min_Δ={wc0.momentum_min_delta:.4f} ({wc0.momentum_min_delta * 100:.3f}%) | "
+        f"mode={wc0.momentum_mode}"
+        + (
+            " [.env override]"
+            if ENV_MOMENTUM_OVERRIDES
+            else ""
+        )
     )
