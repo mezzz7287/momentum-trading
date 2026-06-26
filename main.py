@@ -25,6 +25,8 @@ from config import (  # noqa: E402 — env must be loaded first
 
 validate_trading_assets()
 
+from binance_feed import start_binance_feed, stop_binance_feed  # noqa: E402
+
 if TYPE_CHECKING:
     from bot import AccountService, MarketWorker
 
@@ -169,6 +171,11 @@ async def startup_event():
     asyncio.create_task(_initialize_bots())
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    await stop_binance_feed()
+
+
 async def _initialize_bots():
     global bots, account
     print("🚀 Emiliano Dashboard Starting on Render...")
@@ -187,6 +194,9 @@ async def _initialize_bots():
             return
         account.start_pnl_merge_scheduler()
         print("✅ AccountService ready.")
+
+        await start_binance_feed(wc.asset for wc in WORKER_CONFIGS)
+        print("✅ Binance Futures momentum feed started.")
 
         # ── Per-asset market workers ──────────────────────────────────────
         for wc in WORKER_CONFIGS:

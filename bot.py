@@ -2981,6 +2981,7 @@ class MarketWorker:
     # ── Dashboard data ─────────────────────────────────────────────────
 
     def get_dashboard_data(self) -> dict:
+        self._update_momentum_dashboard()
         pnl_dollars, pnl_pct, _ = self.get_current_pnl()
         wc = self.worker_config
 
@@ -3288,6 +3289,7 @@ def create_dashboard(bots):
     )
 
     for i, bot in enumerate(bots):
+        bot._update_momentum_dashboard()
         d           = bot.dashboard
         pnl_dollars, pnl_pct, pnl_color = bot.get_current_pnl()
         listener_cd = bot.get_listener_countdown()
