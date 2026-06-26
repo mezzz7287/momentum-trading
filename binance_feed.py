@@ -1,12 +1,17 @@
-"""Binance Futures aggTrade feed for momentum signal detection."""
+"""Binance Futures price feed for momentum signal detection.
+
+Uses REST polling (fapi ticker/price) because aggTrade WebSocket often connects
+but delivers no frames on Render and some residential networks. aiohttp is used
+for all HTTP so it matches the existing dependency stack.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Iterable, Literal, Optional, Tuple
+from typing import Deque, Dict, Iterable, Literal, Optional, Tuple
 
 import aiohttp
 
@@ -19,6 +24,9 @@ ASSET_TO_SYMBOL: dict[str, str] = {
     "bnb": "BNBUSDT",
     "hype": "HYPEUSDT",
 }
+
+FAPI_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
+POLL_INTERVAL_SEC = float(os.getenv("BINANCE_POLL_INTERVAL_SEC", "0.25"))
 
 SignalDirection = Literal["UP", "DOWN"]
 
@@ -59,40 +67,6 @@ def record_price(asset: str, price: float, *, recv_ms: Optional[int] = None) -> 
     while len(buf) > _MAX_BUFFER_TICKS:
         buf.popleft()
     _last_update_ms[key] = ts_ms
-
-
-def _parse_agg_trade_payload(raw: Any) -> Optional[float]:
-    """Extract price from raw or combined-stream aggTrade JSON."""
-    if not isinstance(raw, dict):
-        return None
-    event = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-    if not isinstance(event, dict):
-        return None
-    if event.get("e") not in (None, "aggTrade"):
-        return None
-    price_raw = event.get("p")
-    if price_raw is None:
-        return None
-    try:
-        price = float(price_raw)
-    except (TypeError, ValueError):
-        return None
-    return price if price > 0 else None
-
-
-def _decode_ws_message(msg: aiohttp.WSMessage) -> Optional[Any]:
-    if msg.type == aiohttp.WSMsgType.TEXT:
-        raw = msg.data
-    elif msg.type == aiohttp.WSMsgType.BINARY:
-        raw = msg.data.decode("utf-8", errors="replace")
-    else:
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
 
 
 def _window_prices(
@@ -159,42 +133,49 @@ def get_momentum_status(
     }
 
 
-async def _consume_stream(asset: str, symbol: str) -> None:
+async def _poll_price_loop(asset: str, symbol: str) -> None:
+    """Poll Binance Futures mark price over REST — reliable on Render."""
     global _session, _running
-    url = f"wss://fstream.binance.com/ws/{symbol.lower()}@aggTrade"
     backoff = 1.0
+    first_tick_logged = False
+    timeout = aiohttp.ClientTimeout(total=8)
     while _running:
-        first_tick_logged = False
         try:
             assert _session is not None
-            async with _session.ws_connect(url, heartbeat=20) as ws:
-                print(f"📡 [Binance Futures] Connected: {symbol}@aggTrade → {asset.upper()}")
+            async with _session.get(
+                FAPI_TICKER_URL,
+                params={"symbol": symbol.upper()},
+                timeout=timeout,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=resp.status,
+                        message=body[:120],
+                    )
+                data = await resp.json()
+                price = float(data.get("price", 0))
+                if price <= 0:
+                    raise ValueError(f"invalid price payload: {data!r}")
+                recv_ms = int(time.time() * 1000)
+                record_price(asset, price, recv_ms=recv_ms)
                 backoff = 1.0
-                async for msg in ws:
-                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                        break
-                    if msg.type == aiohttp.WSMsgType.ERROR:
-                        raise ConnectionError(f"websocket error: {ws.exception()}")
-                    payload = _decode_ws_message(msg)
-                    if payload is None:
-                        continue
-                    price = _parse_agg_trade_payload(payload)
-                    if price is None:
-                        continue
-                    recv_ms = int(time.time() * 1000)
-                    record_price(asset, price, recv_ms=recv_ms)
-                    if not first_tick_logged:
-                        first_tick_logged = True
-                        print(
-                            f"📡 [Binance Futures] {asset.upper()} first tick "
-                            f"price={price} buf={len(_buffer_for(asset))}"
-                        )
+                if not first_tick_logged:
+                    first_tick_logged = True
+                    print(
+                        f"📡 [Binance REST] {asset.upper()} polling {symbol} "
+                        f"every {POLL_INTERVAL_SEC:.2f}s | first price={price}"
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"⚠️ [Binance Futures] {symbol}: {e} — reconnect in {backoff:.0f}s")
+            print(f"⚠️ [Binance REST] {symbol}: {e} — retry in {backoff:.0f}s")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2, 30.0)
+            continue
+        await asyncio.sleep(POLL_INTERVAL_SEC)
 
 
 async def start_binance_feed(assets: Iterable[str]) -> None:
@@ -212,8 +193,12 @@ async def start_binance_feed(assets: Iterable[str]) -> None:
                 symbols[key] = sym
             else:
                 print(f"⚠️ [Binance Feed] No symbol mapping for asset {asset!r}")
+        print(
+            f"📡 [Binance Feed] REST poll mode ({POLL_INTERVAL_SEC:.2f}s interval) "
+            f"for {len(symbols)} symbol(s)"
+        )
         _tasks = [
-            asyncio.create_task(_consume_stream(asset, symbol))
+            asyncio.create_task(_poll_price_loop(asset, symbol))
             for asset, symbol in symbols.items()
         ]
 
