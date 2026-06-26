@@ -2,7 +2,7 @@
   "defaults": {
     "momentum_lookback_ms": 3000,
     "momentum_min_delta": 0.0015,
-    "momentum_mode": "single_taker",
+    "momentum_mode": "dual_hybrid",
     "momentum_size": 5.1,
     "momentum_max_shares": 5.1,
     "trade_cooldown_ms": 3000,
