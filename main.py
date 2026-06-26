@@ -1520,9 +1520,30 @@ function _fmtCooldownRemaining(sec) {
   return `${m}m ${String(r).padStart(2, '0')}s`;
 }
 
+function _fmtPositionRow(bot) {
+  const ySh = Number(bot.yes_shares) || 0;
+  const nSh = Number(bot.no_shares) || 0;
+  if (ySh <= 0 && nSh <= 0) return '-';
+  const parts = [];
+  let yesCost = 0;
+  let noCost = 0;
+  if (ySh > 0) {
+    yesCost = ySh * (Number(bot.yes_avg_price_c) || 0) / 100;
+    parts.push(`YES @ $${yesCost.toFixed(2)}`);
+  }
+  if (nSh > 0) {
+    noCost = nSh * (Number(bot.no_avg_price_c) || 0) / 100;
+    parts.push(`NO @ $${noCost.toFixed(2)}`);
+  }
+  let text = parts.join(' ');
+  if (ySh > 0 && nSh > 0) text += ` (pair=$${(yesCost + noCost).toFixed(1)})`;
+  return text;
+}
+
 function renderCard(bot){
   const hasInv=(bot.yes_shares||0)>0||(bot.no_shares||0)>0;
-  const hasPos=(bot.position&&bot.position!=='-')||hasInv;
+  const positionRow = _fmtPositionRow(bot);
+  const hasPos = positionRow !== '-' || hasInv;
   const pnlPos=(bot.pnl_dollars||0)>=0;
   const cumPos=(bot.cumulative_pnl||0)>=0;
   const inProfit=hasInv&&(bot.pnl_dollars||0)>0;
@@ -1602,7 +1623,7 @@ function renderCard(bot){
       <div class="space-y-1.5 text-sm mb-3">
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Position</span>
-          <span class="font-mono text-zinc-200">${bot.position||'-'}</span>
+          <span class="font-mono text-zinc-200">${positionRow}</span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Trade PnL</span>

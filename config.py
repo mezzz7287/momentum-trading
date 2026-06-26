@@ -73,6 +73,17 @@ def _parse_positive_int(name: str, value: Any) -> int:
     return v
 
 
+def _parse_order_size(name: str, value: Any, default: float) -> float:
+    raw = value if value is not None else default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _fatal(f"{name}={raw!r} is not a valid number.")
+    if v < MIN_SHARES or v != v or v in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be >= {MIN_SHARES} (got {raw!r}).")
+    return v
+
+
 def _parse_max_shares(name: str, value: Any, default: float) -> float:
     raw = value if value is not None else default
     try:
@@ -110,8 +121,8 @@ class WorkerConfig:
     window: str
     spread_threshold: float = 0.03
     trade_cooldown_ms: int = 3000
-    spread_size: int = 10
-    max_order_size: int = 10
+    spread_size: float = 10.0
+    max_order_size: float = 10.0
     max_shares: float = 10.2
     price_bias: float = 0.01
     dry_run: bool = DRY_RUN_DEFAULT
@@ -156,11 +167,15 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         raw.get("trade_cooldown_ms", defaults.get("trade_cooldown_ms")),
         int(defaults.get("trade_cooldown_ms", 3000)),
     )
-    spread_size = _parse_positive_int(
-        "spread_size", raw.get("spread_size", defaults.get("spread_size", 10))
+    spread_size = _parse_order_size(
+        "spread_size",
+        raw.get("spread_size", defaults.get("spread_size")),
+        float(defaults.get("spread_size", 10.0)),
     )
-    max_order = _parse_positive_int(
-        "max_order_size", raw.get("max_order_size", defaults.get("max_order_size", 10))
+    max_order = _parse_order_size(
+        "max_order_size",
+        raw.get("max_order_size", defaults.get("max_order_size")),
+        float(defaults.get("max_order_size", 10.0)),
     )
     max_shares = _parse_max_shares(
         "max_shares",

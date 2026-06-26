@@ -2586,7 +2586,7 @@ class MarketWorker:
         self.add_log(msg[:120])
 
     async def place_spread_gtc(
-        self, side: str, price: float, size: int,
+        self, side: str, price: float, size: float,
     ) -> Tuple[Optional[str], float]:
         if not self.validate_spread_order_size(side, float(size)):
             return None, 0.0
@@ -2599,7 +2599,7 @@ class MarketWorker:
             return order_id, float(size)
         return order_id, 0.0
 
-    async def poll_order_fill(self, order_id: str, requested: int) -> float:
+    async def poll_order_fill(self, order_id: str, requested: float) -> float:
         try:
             info = self.account.get_order_status(order_id)
             if isinstance(info, str):
@@ -2892,7 +2892,7 @@ class MarketWorker:
         self,
         side: str,
         price: float,
-        size: int,
+        size: float,
         *,
         order_type: str = "GTC",
     ) -> Tuple[bool, Optional[str], bool]:
@@ -3167,19 +3167,17 @@ class MarketWorker:
 
         if inv.yes_shares > 0 or inv.no_shares > 0:
             leg_parts: List[str] = []
+            yes_cost = 0.0
+            no_cost = 0.0
             if inv.yes_shares > 0:
-                leg_parts.append(
-                    f"Y{inv.yes_shares:.1f}@{round(inv.avg_cost('YES') * 100)}c"
-                )
+                yes_cost = inv.yes_shares * inv.avg_cost("YES")
+                leg_parts.append(f"YES @ ${yes_cost:.2f}")
             if inv.no_shares > 0:
-                leg_parts.append(
-                    f"N{inv.no_shares:.1f}@{round(inv.avg_cost('NO') * 100)}c"
-                )
-            position_text = " · ".join(leg_parts)
+                no_cost = inv.no_shares * inv.avg_cost("NO")
+                leg_parts.append(f"NO @ ${no_cost:.2f}")
+            position_text = " ".join(leg_parts)
             if inv.yes_shares > 0 and inv.no_shares > 0:
-                position_text += (
-                    f" (pair={round((inv.avg_cost('YES') + inv.avg_cost('NO')) * 100)}c)"
-                )
+                position_text += f" (pair=${yes_cost + no_cost:.1f})"
         else:
             position_text = "-"
 

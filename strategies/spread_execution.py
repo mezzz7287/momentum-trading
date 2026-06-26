@@ -118,7 +118,7 @@ async def execute_spread_decision(worker: "MarketWorker", decision: SpreadDecisi
             + " ".join(f"{s}@{round(p*100)}c" for s, p in legs)
         )
 
-        order_size = int(decision.size)
+        order_size = float(decision.size)
         placed = await asyncio.gather(
             *[
                 worker.place_spread_gtc(side, price, order_size)
