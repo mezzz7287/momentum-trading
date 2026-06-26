@@ -139,15 +139,43 @@ def _load_env_sizing_overrides() -> Optional[dict[str, float]]:
             f"to override sizing (found: {', '.join(set_keys)}). "
             "Omit both to use trading_config.json defaults."
         )
+    fixed = _parse_order_size("MOMENTUM_SIZE", raw["MOMENTUM_SIZE"], 0.0)
     return {
-        "momentum_size": _parse_order_size("MOMENTUM_SIZE", raw["MOMENTUM_SIZE"], 0.0),
+        "momentum_size_min": fixed,
+        "momentum_size_max": fixed,
         "momentum_max_shares": _parse_max_shares(
             "MOMENTUM_MAX_SHARES", raw["MOMENTUM_MAX_SHARES"], 0.0,
         ),
     }
 
 
+def _load_env_size_range_overrides() -> Optional[dict[str, float]]:
+    """Optional MOMENTUM_SIZE_MIN + MOMENTUM_SIZE_MAX for randomized order sizing."""
+    keys = ("MOMENTUM_SIZE_MIN", "MOMENTUM_SIZE_MAX")
+    raw = {k: os.getenv(k, "").strip() for k in keys}
+    set_keys = [k for k, v in raw.items() if v]
+    if not set_keys:
+        return None
+    if len(set_keys) != len(keys):
+        _fatal(
+            "MOMENTUM_SIZE_MIN and MOMENTUM_SIZE_MAX must both be set together "
+            f"to override size range (found: {', '.join(set_keys)})."
+        )
+    lo = _parse_order_size("MOMENTUM_SIZE_MIN", raw["MOMENTUM_SIZE_MIN"], 0.0)
+    hi = _parse_order_size("MOMENTUM_SIZE_MAX", raw["MOMENTUM_SIZE_MAX"], 0.0)
+    if lo > hi:
+        _fatal(f"MOMENTUM_SIZE_MIN ({lo}) cannot exceed MOMENTUM_SIZE_MAX ({hi}).")
+    out: dict[str, float] = {"momentum_size_min": lo, "momentum_size_max": hi}
+    max_shares_raw = os.getenv("MOMENTUM_MAX_SHARES", "").strip()
+    if max_shares_raw:
+        out["momentum_max_shares"] = _parse_max_shares(
+            "MOMENTUM_MAX_SHARES", max_shares_raw, 0.0,
+        )
+    return out
+
+
 ENV_SIZING_OVERRIDES: Optional[dict[str, float]] = _load_env_sizing_overrides()
+ENV_SIZE_RANGE_OVERRIDES: Optional[dict[str, float]] = _load_env_size_range_overrides()
 
 
 def _load_env_momentum_overrides() -> dict[str, float | int]:
@@ -179,7 +207,8 @@ class WorkerConfig:
     momentum_lookback_ms: int = 3000
     momentum_min_delta: float = 0.0015
     momentum_mode: str = "single_taker"
-    momentum_size: float = 10.0
+    momentum_size_min: float = 5.1
+    momentum_size_max: float = 9.9
     momentum_max_shares: float = 10.2
     trade_cooldown_ms: int = 3000
     dry_run: bool = DRY_RUN_DEFAULT
@@ -229,11 +258,25 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         raw.get("momentum_mode", defaults.get("momentum_mode")),
         str(defaults.get("momentum_mode", "single_taker")),
     )
-    momentum_size = _parse_order_size(
-        "momentum_size",
-        raw.get("momentum_size", defaults.get("momentum_size")),
-        float(defaults.get("momentum_size", 10.0)),
-    )
+    min_raw = raw.get("momentum_size_min", defaults.get("momentum_size_min"))
+    max_raw = raw.get("momentum_size_max", defaults.get("momentum_size_max"))
+    if min_raw is not None or max_raw is not None:
+        if min_raw is None or max_raw is None:
+            _fatal(f"{asset}:{window}: momentum_size_min and momentum_size_max must both be set.")
+        momentum_size_min = _parse_order_size(
+            "momentum_size_min", min_raw, float(defaults.get("momentum_size_min", 5.1)),
+        )
+        momentum_size_max = _parse_order_size(
+            "momentum_size_max", max_raw, float(defaults.get("momentum_size_max", 9.9)),
+        )
+    else:
+        fixed = _parse_order_size(
+            "momentum_size",
+            raw.get("momentum_size", defaults.get("momentum_size")),
+            float(defaults.get("momentum_size", 10.0)),
+        )
+        momentum_size_min = fixed
+        momentum_size_max = fixed
     momentum_max_shares = _parse_max_shares(
         "momentum_max_shares",
         raw.get("momentum_max_shares", defaults.get("momentum_max_shares")),
@@ -246,19 +289,30 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
     )
 
     if ENV_SIZING_OVERRIDES:
-        momentum_size = ENV_SIZING_OVERRIDES["momentum_size"]
+        momentum_size_min = ENV_SIZING_OVERRIDES["momentum_size_min"]
+        momentum_size_max = ENV_SIZING_OVERRIDES["momentum_size_max"]
         momentum_max_shares = ENV_SIZING_OVERRIDES["momentum_max_shares"]
+    elif ENV_SIZE_RANGE_OVERRIDES:
+        momentum_size_min = ENV_SIZE_RANGE_OVERRIDES["momentum_size_min"]
+        momentum_size_max = ENV_SIZE_RANGE_OVERRIDES["momentum_size_max"]
+        if "momentum_max_shares" in ENV_SIZE_RANGE_OVERRIDES:
+            momentum_max_shares = ENV_SIZE_RANGE_OVERRIDES["momentum_max_shares"]
+
+    if momentum_size_min > momentum_size_max:
+        _fatal(
+            f"{asset}:{window}: momentum_size_min ({momentum_size_min}) "
+            f"cannot exceed momentum_size_max ({momentum_size_max})"
+        )
+    if momentum_size_max > momentum_max_shares:
+        _fatal(
+            f"{asset}:{window}: momentum_size_max ({momentum_size_max}) "
+            f"cannot exceed momentum_max_shares ({momentum_max_shares})"
+        )
 
     if "momentum_min_delta" in ENV_MOMENTUM_OVERRIDES:
         momentum_min_delta = float(ENV_MOMENTUM_OVERRIDES["momentum_min_delta"])
     if "momentum_lookback_ms" in ENV_MOMENTUM_OVERRIDES:
         momentum_lookback_ms = int(ENV_MOMENTUM_OVERRIDES["momentum_lookback_ms"])
-
-    if momentum_size > momentum_max_shares:
-        _fatal(
-            f"{asset}:{window}: momentum_size ({momentum_size}) "
-            f"cannot exceed momentum_max_shares ({momentum_max_shares})"
-        )
 
     dr_raw = raw.get("dry_run", defaults.get("dry_run"))
     if dr_raw is None:
@@ -307,7 +361,8 @@ def _merge_worker_entry(raw: dict, defaults: dict) -> WorkerConfig:
         momentum_lookback_ms=momentum_lookback_ms,
         momentum_min_delta=momentum_min_delta,
         momentum_mode=momentum_mode,
-        momentum_size=momentum_size,
+        momentum_size_min=momentum_size_min,
+        momentum_size_max=momentum_size_max,
         momentum_max_shares=momentum_max_shares,
         trade_cooldown_ms=trade_cooldown_ms,
         dry_run=dry_run,
@@ -434,16 +489,16 @@ print(
 print(f"🧪 DRY_RUN_DEFAULT={DRY_RUN_DEFAULT}")
 if WORKER_CONFIGS:
     wc0 = WORKER_CONFIGS[0]
-    if ENV_SIZING_OVERRIDES:
-        print(
-            f"📐 Sizing (.env override): size={wc0.momentum_size} | "
-            f"max_shares={wc0.momentum_max_shares}"
-        )
-    else:
-        print(
-            f"📐 Sizing (trading_config.json): size={wc0.momentum_size} | "
-            f"max_shares={wc0.momentum_max_shares}"
-        )
+    size_label = (
+        f"{wc0.momentum_size_min}-{wc0.momentum_size_max}"
+        if wc0.momentum_size_min != wc0.momentum_size_max
+        else str(wc0.momentum_size_min)
+    )
+    sizing_src = ".env override" if (ENV_SIZING_OVERRIDES or ENV_SIZE_RANGE_OVERRIDES) else "trading_config.json"
+    print(
+        f"📐 Sizing ({sizing_src}): size={size_label} random | "
+        f"max_shares={wc0.momentum_max_shares}"
+    )
     print(
         f"📈 Momentum: lookback={wc0.momentum_lookback_ms}ms | "
         f"min_Δ={wc0.momentum_min_delta:.4f} ({wc0.momentum_min_delta * 100:.3f}%) | "

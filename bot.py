@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import threading
 import requests  # type: ignore
@@ -2177,7 +2178,7 @@ class MarketWorker:
         self.start_delay_met   = False
         self.market_start_time: Optional[float] = None
 
-        self.dummy_balance  = float(worker_config.momentum_size)
+        self.dummy_balance  = float(worker_config.momentum_size_max)
         self.last_trade_time = 0
         self.logged_markets  = set()
 
@@ -2361,10 +2362,17 @@ class MarketWorker:
         room = self.momentum_headroom(side)
         if room < MIN_SHARES:
             return None
-        size = min(float(wc.momentum_size), room)
+        lo = float(wc.momentum_size_min)
+        hi = min(float(wc.momentum_size_max), room)
+        if hi < MIN_SHARES:
+            return None
+        if hi <= lo:
+            size = hi
+        else:
+            size = random.uniform(lo, hi)
         if size < MIN_SHARES:
             return None
-        return round(size, 4)
+        return round(size, 1)
 
     def validate_momentum_order_size(self, side: str, size: float) -> bool:
         wc = self.worker_config
@@ -3027,7 +3035,8 @@ class MarketWorker:
             "momentum_lookback_ms": wc.momentum_lookback_ms,
             "momentum_feed_fresh": self.dashboard.get("momentum_feed_fresh", False),
             "momentum_max_shares": wc.momentum_max_shares,
-            "momentum_size":      wc.momentum_size,
+            "momentum_size_min":  wc.momentum_size_min,
+            "momentum_size_max":  wc.momentum_size_max,
             "yes_shares":         self.dashboard.get("yes_shares", 0.0),
             "no_shares":          self.dashboard.get("no_shares", 0.0),
             "yes_avg_price_c":    self.dashboard.get("yes_avg_price_c", 0.0),
@@ -3195,7 +3204,12 @@ class MarketWorker:
         print(f"  Momentum lookback : {wc.momentum_lookback_ms}ms")
         print(f"  Min delta         : {wc.momentum_min_delta:.4f} ({wc.momentum_min_delta*100:.2f}%)")
         print(f"  Execution mode    : {wc.momentum_mode}")
-        print(f"  Order size        : {wc.momentum_size} shares (max {wc.momentum_max_shares}/side)")
+        size_label = (
+            f"{wc.momentum_size_min}-{wc.momentum_size_max} (random)"
+            if wc.momentum_size_min != wc.momentum_size_max
+            else str(wc.momentum_size_min)
+        )
+        print(f"  Order size        : {size_label} shares (max {wc.momentum_max_shares}/side)")
         print(f"  Cooldown          : {wc.trade_cooldown_ms}ms after order")
         if self.is_dry_run():
             print(f"  Dry-run fill delay: {wc.dry_run_fill_delay_min_ms}-"
@@ -3543,7 +3557,7 @@ if __name__ == "__main__":
         print("🚀 Starting EmilianoBot — Momentum Trading...")
         for wc in WORKER_CONFIGS:
             print(f"   {wc.asset.upper()} {wc.window}: Δ>{wc.momentum_min_delta:.4f} "
-                  f"| size={wc.momentum_size} | max={wc.momentum_max_shares}/side "
+                  f"| size={wc.momentum_size_min}-{wc.momentum_size_max} | max={wc.momentum_max_shares}/side "
                   f"| mode={wc.momentum_mode} | dry_run={wc.dry_run}")
         asyncio.run(main())
     except KeyboardInterrupt:
