@@ -1,8 +1,8 @@
-"""Binance Futures price feed for momentum signal detection.
+"""Spot/perp price feed for momentum signal detection.
 
-Uses REST polling (fapi ticker/price) because aggTrade WebSocket often connects
-but delivers no frames on Render and some residential networks. aiohttp is used
-for all HTTP so it matches the existing dependency stack.
+Binance Futures is geo-blocked (HTTP 451) on Render and other US datacenters.
+Default provider is Coinbase Exchange (spot); BNB/HYPE use Bybit linear.
+Set PRICE_FEED=binance to force Binance Futures (works outside restricted regions).
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from typing import Deque, Dict, Iterable, Literal, Optional, Tuple
 
 import aiohttp
 
-ASSET_TO_SYMBOL: dict[str, str] = {
+# Binance Futures (blocked in US / Render)
+BINANCE_SYMBOL: dict[str, str] = {
     "btc": "BTCUSDT",
     "eth": "ETHUSDT",
     "sol": "SOLUSDT",
@@ -25,8 +26,25 @@ ASSET_TO_SYMBOL: dict[str, str] = {
     "hype": "HYPEUSDT",
 }
 
+# Coinbase Exchange spot (US-friendly)
+COINBASE_PRODUCT: dict[str, str] = {
+    "btc": "BTC-USD",
+    "eth": "ETH-USD",
+    "sol": "SOL-USD",
+    "xrp": "XRP-USD",
+    "doge": "DOGE-USD",
+}
+
+# Bybit linear perps (fallback for assets not on Coinbase)
+BYBIT_SYMBOL: dict[str, str] = dict(BINANCE_SYMBOL)
+
 FAPI_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
+COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/{product}/ticker"
+BYBIT_TICKER_URL = "https://api.bybit.com/v5/market/tickers"
+
 POLL_INTERVAL_SEC = float(os.getenv("BINANCE_POLL_INTERVAL_SEC", "0.25"))
+# auto | coinbase | binance | bybit  (coinbase default — Render/US blocks Binance)
+PRICE_FEED = os.getenv("PRICE_FEED", "coinbase").strip().lower()
 
 SignalDirection = Literal["UP", "DOWN"]
 
@@ -37,10 +55,34 @@ _session: Optional[aiohttp.ClientSession] = None
 _running = False
 _lock = asyncio.Lock()
 _MAX_BUFFER_TICKS = 5000
+_resolved_feed: str = "coinbase"  # effective provider after auto-detect
 
 
 def _normalize_asset(asset: str) -> str:
     return (asset or "").strip().lower()
+
+
+def _feed_for_asset(asset: str, feed: str) -> Optional[Tuple[str, str]]:
+    """Return (provider, symbol_or_product) for asset, or None if unsupported."""
+    key = _normalize_asset(asset)
+    if feed == "binance":
+        sym = BINANCE_SYMBOL.get(key)
+        return ("binance", sym) if sym else None
+    if feed == "bybit":
+        sym = BYBIT_SYMBOL.get(key)
+        return ("bybit", sym) if sym else None
+    if feed == "coinbase":
+        product = COINBASE_PRODUCT.get(key)
+        if product:
+            return ("coinbase", product)
+        sym = BYBIT_SYMBOL.get(key)
+        return ("bybit", sym) if sym else None
+    # auto: prefer coinbase path (Render-safe default after any 451)
+    product = COINBASE_PRODUCT.get(key)
+    if product:
+        return ("coinbase", product)
+    sym = BYBIT_SYMBOL.get(key)
+    return ("bybit", sym) if sym else None
 
 
 def _buffer_for(asset: str) -> Deque[Tuple[int, float]]:
@@ -133,45 +175,115 @@ def get_momentum_status(
     }
 
 
-async def _poll_price_loop(asset: str, symbol: str) -> None:
-    """Poll Binance Futures mark price over REST — reliable on Render."""
-    global _session, _running
+def _is_geo_blocked(resp: aiohttp.ClientResponse, body: str) -> bool:
+    if resp.status == 451:
+        return True
+    return resp.status == 403 and "restricted location" in body.lower()
+
+
+async def _fetch_price(
+    session: aiohttp.ClientSession,
+    provider: str,
+    symbol: str,
+    timeout: aiohttp.ClientTimeout,
+) -> float:
+    if provider == "binance":
+        async with session.get(
+            FAPI_TICKER_URL,
+            params={"symbol": symbol.upper()},
+            timeout=timeout,
+        ) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                if _is_geo_blocked(resp, body):
+                    raise _GeoBlockedError(provider)
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history, status=resp.status, message=body[:120],
+                )
+            data = await resp.json(content_type=None)
+            price = float(data.get("price", 0))
+    elif provider == "coinbase":
+        url = COINBASE_TICKER_URL.format(product=symbol)
+        async with session.get(url, timeout=timeout) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history, status=resp.status, message=body[:120],
+                )
+            data = await resp.json(content_type=None)
+            price = float(data.get("price", 0))
+    elif provider == "bybit":
+        async with session.get(
+            BYBIT_TICKER_URL,
+            params={"category": "linear", "symbol": symbol.upper()},
+            timeout=timeout,
+        ) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history, status=resp.status, message=body[:120],
+                )
+            data = await resp.json(content_type=None)
+            items = (data.get("result") or {}).get("list") or []
+            if not items:
+                raise ValueError(f"bybit empty ticker: {data!r}")
+            price = float(items[0].get("lastPrice", 0))
+    else:
+        raise ValueError(f"unknown provider {provider!r}")
+
+    if price <= 0:
+        raise ValueError(f"invalid price from {provider}/{symbol}")
+    return price
+
+
+class _GeoBlockedError(Exception):
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        super().__init__(f"{provider} geo-blocked")
+
+
+async def _poll_price_loop(asset: str) -> None:
+    """Poll exchange REST ticker for one asset."""
+    global _session, _running, _resolved_feed
     backoff = 1.0
     first_tick_logged = False
     timeout = aiohttp.ClientTimeout(total=8)
     while _running:
+        provider_symbol = _feed_for_asset(asset, _resolved_feed)
+        if provider_symbol is None:
+            print(f"⚠️ [Price Feed] No feed mapping for asset {asset!r}")
+            await asyncio.sleep(30.0)
+            continue
+        provider, symbol = provider_symbol
         try:
             assert _session is not None
-            async with _session.get(
-                FAPI_TICKER_URL,
-                params={"symbol": symbol.upper()},
-                timeout=timeout,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info,
-                        resp.history,
-                        status=resp.status,
-                        message=body[:120],
-                    )
-                data = await resp.json()
-                price = float(data.get("price", 0))
-                if price <= 0:
-                    raise ValueError(f"invalid price payload: {data!r}")
-                recv_ms = int(time.time() * 1000)
-                record_price(asset, price, recv_ms=recv_ms)
-                backoff = 1.0
-                if not first_tick_logged:
-                    first_tick_logged = True
-                    print(
-                        f"📡 [Binance REST] {asset.upper()} polling {symbol} "
-                        f"every {POLL_INTERVAL_SEC:.2f}s | first price={price}"
-                    )
+            price = await _fetch_price(_session, provider, symbol, timeout)
+            recv_ms = int(time.time() * 1000)
+            record_price(asset, price, recv_ms=recv_ms)
+            backoff = 1.0
+            if not first_tick_logged:
+                first_tick_logged = True
+                print(
+                    f"📡 [Price Feed] {asset.upper()} via {provider} {symbol} "
+                    f"every {POLL_INTERVAL_SEC:.2f}s | first price={price}"
+                )
         except asyncio.CancelledError:
             raise
+        except _GeoBlockedError as e:
+            if PRICE_FEED in ("auto", "binance") and _resolved_feed == "binance":
+                _resolved_feed = "coinbase"
+                print(
+                    f"⚠️ [Price Feed] {e.provider} geo-blocked (451) — "
+                    f"switching to Coinbase/Bybit for all assets"
+                )
+                backoff = 0.5
+            else:
+                print(f"⚠️ [Price Feed] {symbol} ({provider}): geo-blocked — retry in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            continue
         except Exception as e:
-            print(f"⚠️ [Binance REST] {symbol}: {e} — retry in {backoff:.0f}s")
+            print(f"⚠️ [Price Feed] {symbol} ({provider}): {e} — retry in {backoff:.0f}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
             continue
@@ -179,27 +291,34 @@ async def _poll_price_loop(asset: str, symbol: str) -> None:
 
 
 async def start_binance_feed(assets: Iterable[str]) -> None:
-    global _session, _running, _tasks
+    global _session, _running, _tasks, _resolved_feed
     async with _lock:
         if _running:
             return
         _running = True
-        _session = aiohttp.ClientSession()
-        symbols: dict[str, str] = {}
-        for asset in assets:
-            key = _normalize_asset(asset)
-            sym = ASSET_TO_SYMBOL.get(key)
-            if sym:
-                symbols[key] = sym
-            else:
-                print(f"⚠️ [Binance Feed] No symbol mapping for asset {asset!r}")
+        if PRICE_FEED == "auto":
+            _resolved_feed = "binance"
+        elif PRICE_FEED in ("coinbase", "binance", "bybit"):
+            _resolved_feed = PRICE_FEED
+        else:
+            print(f"⚠️ [Price Feed] Unknown PRICE_FEED={PRICE_FEED!r}, using coinbase")
+            _resolved_feed = "coinbase"
+
+        _session = aiohttp.ClientSession(
+            headers={"User-Agent": "mezzz-momentum-bot/1.0"},
+        )
+        asset_list = [_normalize_asset(a) for a in assets]
+        mapped = [a for a in asset_list if _feed_for_asset(a, _resolved_feed)]
+        for a in asset_list:
+            if a not in mapped:
+                print(f"⚠️ [Price Feed] No symbol mapping for asset {a!r}")
         print(
-            f"📡 [Binance Feed] REST poll mode ({POLL_INTERVAL_SEC:.2f}s interval) "
-            f"for {len(symbols)} symbol(s)"
+            f"📡 [Price Feed] REST poll ({POLL_INTERVAL_SEC:.2f}s) | "
+            f"PRICE_FEED={PRICE_FEED} → {_resolved_feed} | {len(mapped)} asset(s)"
         )
         _tasks = [
-            asyncio.create_task(_poll_price_loop(asset, symbol))
-            for asset, symbol in symbols.items()
+            asyncio.create_task(_poll_price_loop(asset))
+            for asset in mapped
         ]
 
 

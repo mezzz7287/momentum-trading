@@ -196,7 +196,7 @@ async def _initialize_bots():
         print("✅ AccountService ready.")
 
         await start_binance_feed(wc.asset for wc in WORKER_CONFIGS)
-        print("✅ Binance Futures momentum feed started.")
+        print("✅ Momentum price feed started (Coinbase/Bybit on Render; set PRICE_FEED=binance elsewhere).")
 
         # ── Per-asset market workers ──────────────────────────────────────
         for wc in WORKER_CONFIGS:
